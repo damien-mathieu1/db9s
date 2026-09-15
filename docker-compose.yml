@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: db9s
+      POSTGRES_PASSWORD: db9s
+      POSTGRES_DB: db9s
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "57017:27017"
