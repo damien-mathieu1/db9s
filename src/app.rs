@@ -385,18 +385,14 @@ impl App {
             }
             KeyCode::Char('e') if self.rows_focused() => self.start_field_edit(),
             KeyCode::Char('E') if self.rows_focused() => self.start_edit(),
-            KeyCode::Char('d') if self.rows_focused() => {
-                if self.selected_row().is_some() {
-                    self.mode = Mode::ConfirmDelete;
-                }
+            KeyCode::Char('d') if self.rows_focused() && self.selected_row().is_some() => {
+                self.mode = Mode::ConfirmDelete;
             }
             KeyCode::Char('s') if self.screen == Screen::Connections => self.start_settings(),
             KeyCode::Char('a') if self.screen == Screen::Connections => self.start_add_conn(),
             KeyCode::Char('e') if self.screen == Screen::Connections => self.start_edit_conn(),
-            KeyCode::Char('d') if self.screen == Screen::Connections => {
-                if !self.conns.is_empty() {
-                    self.mode = Mode::ConfirmDeleteConn;
-                }
+            KeyCode::Char('d') if self.screen == Screen::Connections && !self.conns.is_empty() => {
+                self.mode = Mode::ConfirmDeleteConn;
             }
             _ => {}
         }
