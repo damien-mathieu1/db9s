@@ -297,14 +297,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if app.status.starts_with("error") || app.status.starts_with("failed") {
-        f.render_widget(
-            Paragraph::new(app.status.as_str()).style(Style::default().fg(theme::ERROR)),
-            area,
-        );
-        return;
+    let mut line = help_line(app.key_hints());
+    if !app.status.is_empty() {
+        let is_err = app.status.starts_with("error") || app.status.starts_with("failed");
+        let color = if is_err {
+            theme::ERROR
+        } else {
+            theme::HELP_TEXT
+        };
+        line.spans.push(Span::styled(
+            format!("  │ {}", app.status),
+            Style::default().fg(color),
+        ));
     }
-    f.render_widget(Paragraph::new(help_line(&app.status)), area);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 /// Renders a "key action  key action" hint string with bold keys, muted descriptions.

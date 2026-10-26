@@ -212,7 +212,7 @@ impl App {
             result: None,
             offset: 0,
             query_input: String::new(),
-            status: "j/k move  enter open  tab switch pane  esc back  a add conn  s settings  / query  e edit  d delete  q quit".into(),
+            status: String::new(),
             should_quit: false,
             editor_request: None,
             pending_edit: None,
@@ -348,8 +348,14 @@ impl App {
                     BrowseFocus::Rows => BrowseFocus::Containers,
                 };
             }
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_selection(1);
+                self.preview_container().await;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_selection(-1);
+                self.preview_container().await;
+            }
             KeyCode::Enter => self.enter().await,
             KeyCode::Char('r') if self.rows_focused() => self.load_rows().await,
             KeyCode::Char('n') if self.rows_focused() => {
@@ -379,6 +385,28 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Key hints for the footer, same for every backend since all go through `DataSource`.
+    pub fn key_hints(&self) -> &'static str {
+        match self.screen {
+            Screen::Connections => "j/k move  enter open  a add  e edit  d delete  s settings  q quit",
+            Screen::Databases => "j/k move  enter open  esc back",
+            Screen::Browse => match self.browse_focus {
+                BrowseFocus::Containers => "j/k move+preview  enter/tab rows  esc back",
+                BrowseFocus::Rows => {
+                    "j/k move  e edit  d delete  / query  n/p page  r refresh  tab containers  esc back"
+                }
+            },
+        }
+    }
+
+    // shortcut: one fetch per keypress, no debounce; add one if holding j/k on many tables gets slow
+    async fn preview_container(&mut self) {
+        if self.screen == Screen::Browse && self.browse_focus == BrowseFocus::Containers {
+            self.offset = 0;
+            self.load_rows().await;
         }
     }
 
@@ -471,19 +499,16 @@ impl App {
                         self.screen = Screen::Browse;
                         self.browse_focus = BrowseFocus::Containers;
                         self.status = String::new();
+                        self.load_rows().await;
                     }
                     Err(e) => self.status = format!("error: {e}"),
                 }
             }
             Screen::Browse => match self.browse_focus {
-                BrowseFocus::Containers => {
-                    if self.current_container().is_none() {
-                        return;
-                    }
-                    self.offset = 0;
-                    self.load_rows().await;
+                BrowseFocus::Containers if self.result.is_some() => {
                     self.browse_focus = BrowseFocus::Rows;
                 }
+                BrowseFocus::Containers => {}
                 BrowseFocus::Rows => {}
             },
         }
