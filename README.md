@@ -51,7 +51,8 @@ left, rows/documents (as cards) on the right.
 | `tab` | switch focus between containers and rows pane |
 | `esc` / `q` | back a level (`q` quits from connections) |
 | `/` | raw query (SQL for postgres, JSON filter or `[$match, ...]` pipeline for mongo) |
-| `e` | edit selected row/document in `$EDITOR`, confirm diff to save |
+| `e` | edit selected row/document inline, field by field (`enter` edit field, `ctrl+s` save) |
+| `E` | edit selected row/document in `$EDITOR`, confirm diff to save |
 | `d` | delete selected row/document |
 | `n` / `p` | next / previous page |
 | `r` | refresh |
