@@ -184,7 +184,52 @@ fn draw_browse(f: &mut Frame, area: Rect, app: &App) {
         app.container_idx,
         containers_focused,
     );
-    draw_rows_pane(f, cols[1], app, !containers_focused);
+    match &app.field_edit {
+        Some(fe) => draw_field_editor(f, cols[1], fe),
+        None => draw_rows_pane(f, cols[1], app, !containers_focused),
+    }
+}
+
+/// Inline row editor: one `field: value` line per field, changed fields marked with `●`.
+fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit) {
+    let items: Vec<ListItem> = fe
+        .edited
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| {
+            let changed = fe.original.get(k) != Some(v);
+            let value = match (&fe.input, i == fe.idx) {
+                (Some(input), true) => format!("{input}_"),
+                _ => compact(v),
+            };
+            let mut style = Style::default();
+            if i == fe.idx {
+                style = selected_style();
+            }
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if changed { "● " } else { "  " },
+                    Style::default().fg(theme::CONFIRM),
+                ),
+                Span::styled(
+                    format!("{k}: "),
+                    Style::default()
+                        .fg(theme::DOC_TEXT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(value),
+            ]))
+            .style(style)
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(theme::BORDER_TYPE)
+            .border_style(pane_border(true))
+            .title("edit row"),
+    );
+    f.render_widget(list, area);
 }
 
 /// Each row/document renders as its own card, mongotui-style: up to 4

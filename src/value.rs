@@ -86,3 +86,35 @@ fn decode_pg_value(row: &sqlx::postgres::PgRow, col: &sqlx::postgres::PgColumn) 
 
     result.unwrap_or(Value::Null)
 }
+
+/// Text shown in the inline field editor: strings unquoted, everything else as JSON.
+pub fn value_to_input(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parses inline input back to a value: valid JSON (`42`, `true`, `null`, `"42"`, `{..}`)
+/// keeps its type, anything else becomes a plain string.
+pub fn input_to_value(input: &str) -> Value {
+    serde_json::from_str(input).unwrap_or_else(|_| Value::String(input.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn inline_input_round_trips_and_infers_types() {
+        assert_eq!(input_to_value("hello"), json!("hello"));
+        assert_eq!(input_to_value("42"), json!(42));
+        assert_eq!(input_to_value("\"42\""), json!("42"));
+        assert_eq!(input_to_value("true"), json!(true));
+        assert_eq!(input_to_value("null"), Value::Null);
+        assert_eq!(input_to_value("{\"a\":1}"), json!({"a": 1}));
+        assert_eq!(value_to_input(&json!("hi")), "hi");
+        assert_eq!(value_to_input(&json!(3)), "3");
+    }
+}

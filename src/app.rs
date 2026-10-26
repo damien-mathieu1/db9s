@@ -29,9 +29,19 @@ pub enum Mode {
     Query,
     ConfirmDelete,
     ConfirmEditSave,
+    FieldEdit,
     AddConnection,
     ConfirmDeleteConn,
     Settings,
+}
+
+/// Inline, field-by-field edit of one row/document, saved in one update.
+pub struct FieldEdit {
+    pub original: Row,
+    pub edited: Row,
+    pub idx: usize,
+    /// `Some` while the selected field's value is being typed.
+    pub input: Option<String>,
 }
 
 /// A row/document sent out to the user's $EDITOR; picked up by the main loop
@@ -110,6 +120,7 @@ pub struct App {
 
     pub editor_request: Option<EditorRequest>,
     pub pending_edit: Option<(Row, Row)>,
+    pub field_edit: Option<FieldEdit>,
     pub editor_cmd: String,
     pub settings_editor_input: String,
     pub settings_error: Option<String>,
@@ -216,6 +227,7 @@ impl App {
             should_quit: false,
             editor_request: None,
             pending_edit: None,
+            field_edit: None,
             editor_cmd: editor_cmd.clone(),
             settings_editor_input: editor_cmd,
             settings_error: None,
@@ -325,6 +337,7 @@ impl App {
             Mode::Normal => self.handle_normal_key(key).await,
             Mode::Query => self.handle_query_key(key).await,
             Mode::ConfirmEditSave => self.handle_confirm_edit_save_key(key).await,
+            Mode::FieldEdit => self.handle_field_edit_key(key).await,
             Mode::ConfirmDelete => self.handle_confirm_key(key).await,
             Mode::AddConnection => self.handle_add_conn_key(key).await,
             Mode::ConfirmDeleteConn => self.handle_confirm_delete_conn_key(key).await,
@@ -370,7 +383,8 @@ impl App {
                 self.mode = Mode::Query;
                 self.query_input.clear();
             }
-            KeyCode::Char('e') if self.rows_focused() => self.start_edit(),
+            KeyCode::Char('e') if self.rows_focused() => self.start_field_edit(),
+            KeyCode::Char('E') if self.rows_focused() => self.start_edit(),
             KeyCode::Char('d') if self.rows_focused() => {
                 if self.selected_row().is_some() {
                     self.mode = Mode::ConfirmDelete;
@@ -390,13 +404,20 @@ impl App {
 
     /// Key hints for the footer, same for every backend since all go through `DataSource`.
     pub fn key_hints(&self) -> &'static str {
+        if let Some(fe) = &self.field_edit {
+            return if fe.input.is_some() {
+                "enter apply  esc cancel  (42, true, null, {..} keep their type; \"..\" forces text)"
+            } else {
+                "j/k move  enter edit field  ctrl+s save  esc discard"
+            };
+        }
         match self.screen {
             Screen::Connections => "j/k move  enter open  a add  e edit  d delete  s settings  q quit",
             Screen::Databases => "j/k move  enter open  esc back",
             Screen::Browse => match self.browse_focus {
                 BrowseFocus::Containers => "j/k move+preview  enter/tab rows  esc back",
                 BrowseFocus::Rows => {
-                    "j/k move  e edit  d delete  / query  n/p page  r refresh  tab containers  esc back"
+                    "j/k move  e edit  E $EDITOR  d delete  / query  n/p page  r refresh  tab containers  esc back"
                 }
             },
         }
@@ -575,6 +596,94 @@ impl App {
         }
     }
 
+    async fn save_row(&mut self, original: &Row, edited: &Row) {
+        let db = self.current_db().unwrap_or_default().to_string();
+        let container = self.current_container().unwrap_or_default().to_string();
+        match self
+            .current_source()
+            .unwrap()
+            .update_row(&db, &container, original, edited)
+            .await
+        {
+            Ok(_) => {
+                self.status = "saved".into();
+                self.load_rows().await;
+            }
+            Err(e) => self.status = format!("error: {e}"),
+        }
+    }
+
+    fn start_field_edit(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        self.field_edit = Some(FieldEdit {
+            original: row.clone(),
+            edited: row,
+            idx: 0,
+            input: None,
+        });
+        self.mode = Mode::FieldEdit;
+    }
+
+    async fn handle_field_edit_key(&mut self, key: KeyEvent) {
+        let Some(fe) = self.field_edit.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let Some(field) = fe.edited.keys().nth(fe.idx).cloned() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        if let Some(input) = fe.input.as_mut() {
+            match key.code {
+                KeyCode::Enter => {
+                    let before = crate::value::value_to_input(&fe.edited[&field]);
+                    // untouched text keeps its original type (string "42" stays a string)
+                    if *input != before {
+                        let v = crate::value::input_to_value(input);
+                        fe.edited.insert(field, v);
+                    }
+                    fe.input = None;
+                }
+                KeyCode::Esc => fe.input = None,
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) => input.push(c),
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                fe.idx = (fe.idx + 1).min(fe.edited.len().saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => fe.idx = fe.idx.saturating_sub(1),
+            KeyCode::Enter => fe.input = Some(crate::value::value_to_input(&fe.edited[&field])),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let fe = self.field_edit.take().unwrap();
+                self.mode = Mode::Normal;
+                if fe.edited == fe.original {
+                    self.status = "no changes".into();
+                } else {
+                    self.save_row(&fe.original, &fe.edited).await;
+                }
+            }
+            KeyCode::Esc => {
+                let changed = fe.edited != fe.original;
+                self.field_edit = None;
+                self.mode = Mode::Normal;
+                if changed {
+                    self.status = "edit discarded".into();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Writes the selected row to a temp file and hands the request off to the
     /// main loop, which suspends the TUI and opens $EDITOR (or vi) on it.
     fn start_edit(&mut self) {
@@ -614,24 +723,9 @@ impl App {
     async fn handle_confirm_edit_save_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') => {
-                let Some((original, edited)) = self.pending_edit.take() else {
-                    self.mode = Mode::Normal;
-                    return;
-                };
-                let db = self.current_db().unwrap_or_default().to_string();
-                let container = self.current_container().unwrap_or_default().to_string();
                 self.mode = Mode::Normal;
-                match self
-                    .current_source()
-                    .unwrap()
-                    .update_row(&db, &container, &original, &edited)
-                    .await
-                {
-                    Ok(_) => {
-                        self.status = "saved".into();
-                        self.load_rows().await;
-                    }
-                    Err(e) => self.status = format!("error: {e}"),
+                if let Some((original, edited)) = self.pending_edit.take() {
+                    self.save_row(&original, &edited).await;
                 }
             }
             _ => {
