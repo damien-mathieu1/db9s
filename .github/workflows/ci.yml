@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: db9s
+          POSTGRES_PASSWORD: db9s
+          POSTGRES_DB: db9s
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U db9s" --health-interval 5s --health-timeout 5s --health-retries 10
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DB9S_TEST_POSTGRES_URL: postgres://db9s:db9s@localhost:5432/db9s
+      DB9S_TEST_MONGO_URL: mongodb://localhost:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
