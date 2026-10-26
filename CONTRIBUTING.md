@@ -5,7 +5,8 @@ Issues and PRs are welcome.
 ## Dev setup
 
 ```bash
-docker compose up -d          # local postgres + mongo, seeded with a `users` table/collection
+docker compose up -d          # local postgres + mongo, seeded with `users` and `products` (dev/seed.sql, dev/seed.js)
+docker compose down -v        # wipe data; next `up` re-seeds
 cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017
 ```
 
@@ -14,8 +15,13 @@ cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongod
 ```bash
 cargo fmt
 cargo clippy --all-targets
-cargo test
+DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
+DB9S_TEST_MONGO_URL=mongodb://localhost:57017 cargo test
 ```
+
+`src/datasource/tests.rs` runs the same scenario (list, page, update, query,
+delete) against every backend; a backend without its URL env var is skipped.
+CI runs them all against real Postgres and MongoDB.
 
 Keep the diff focused on one change. No unused code, no new warnings.
 
@@ -23,4 +29,5 @@ Keep the diff focused on one change. No unused code, no new warnings.
 
 Implement the `DataSource` trait (`src/datasource/mod.rs`) in a new module
 under `src/datasource/`, then wire it into `NewConnKind` and the `connect()`
-helper in `src/app.rs`.
+helper in `src/app.rs`. Add a `<backend>_conformance` test calling `exercise()`,
+a seed file in `dev/`, and a service in `docker-compose.yml` and CI.

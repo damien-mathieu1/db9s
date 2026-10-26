@@ -1,5 +1,7 @@
 pub mod mongo;
 pub mod postgres;
+#[cfg(test)]
+mod tests;
 
 use crate::value::Row;
 use anyhow::Result;
