@@ -2,6 +2,13 @@
 name = "db9s"
 version = "0.1.0"
 edition = "2021"
+description = "k9s-style terminal UI to browse, query, and edit Postgres and MongoDB"
+license = "MIT"
+repository = "https://github.com/damien-mathieu1/db9s"
+readme = "README.md"
+keywords = ["tui", "postgres", "mongodb", "database", "ratatui"]
+categories = ["command-line-utilities", "database"]
+exclude = ["dev/", "docker-compose.yml", ".github/"]
 
 [dependencies]
 ratatui = "0.29"

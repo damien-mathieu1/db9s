@@ -5,10 +5,13 @@ one place — built with [ratatui](https://ratatui.rs).
 
 ## Install
 
+Prebuilt binaries (Linux, macOS, Windows) are on the
+[releases page](https://github.com/damien-mathieu1/db9s/releases).
+
+Or with cargo:
+
 ```bash
-git clone https://github.com/damien-mathieu1/db9s.git
-cd db9s
-cargo install --path .
+cargo install db9s
 ```
 
 ## Usage
