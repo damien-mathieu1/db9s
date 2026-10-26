@@ -31,3 +31,15 @@ Implement the `DataSource` trait (`src/datasource/mod.rs`) in a new module
 under `src/datasource/`, then wire it into `NewConnKind` and the `connect()`
 helper in `src/app.rs`. Add a `<backend>_conformance` test calling `exercise()`,
 a seed file in `dev/`, and a service in `docker-compose.yml` and CI.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, merge to `main`, then tag:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The `release` workflow builds Linux/macOS/Windows binaries, attaches them to a
+GitHub Release, and publishes to crates.io if the `CARGO_REGISTRY_TOKEN` repo
+secret is set.
