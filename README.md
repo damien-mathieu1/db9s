@@ -2,7 +2,7 @@
 <h1>db9s</h1>
 A k9s-style terminal UI to browse, query, and edit your databases and message queues 🦀
 
-![db9s](./docs/browse.png)
+![db9s demo](./docs/demo.gif)
 
 <div>
 

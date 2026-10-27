@@ -58,9 +58,10 @@ go to **Actions → Create Release → Run workflow** on `main`. It:
 
 ## Screenshots
 
-`docs/*.png` are generated with [vhs](https://github.com/charmbracelet/vhs) from
+`docs/demo.gif` (README hero) and `docs/*.png` are generated with
+[vhs](https://github.com/charmbracelet/vhs) from `docs/demo.tape` and
 `docs/screenshots.tape`, against the seeded `docker compose` stack:
 
 ```bash
-docker compose up -d && cargo build && vhs docs/screenshots.tape
+docker compose up -d && cargo build && vhs docs/demo.tape && vhs docs/screenshots.tape
 ```

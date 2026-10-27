@@ -24,7 +24,6 @@ Tab
 Sleep 500ms
 Type "j"
 Sleep 1s
-Screenshot docs/browse.png
 
 Type "e"
 Sleep 500ms
