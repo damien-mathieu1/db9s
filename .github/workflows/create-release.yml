@@ -1,0 +1,117 @@
+name: Create Release
+
+# Click "Run workflow" in Actions. Version is CalVer vYYYY.M.N (N = release
+# number in the current month, starting at 1), e.g. v2026.10.1, v2026.10.2.
+on:
+  workflow_dispatch:
+
+# Serialize releases so two runs can never compute the same tag.
+concurrency:
+  group: create-release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  create-release:
+    name: Bump, tag and create GitHub Release
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute CalVer version
+        id: version
+        run: |
+          PREFIX="v$(date -u +%Y).$(date -u +%-m)"
+          LAST=$(git tag --list "${PREFIX}.*" | awk -F. '{print $NF}' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+          VERSION="${PREFIX}.$(( ${LAST:-0} + 1 ))"
+          echo "Next version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --unreleased --strip all --tag ${{ steps.version.outputs.version }}
+        env:
+          OUTPUT: changelog_fragment.md
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # crates.io publishes the version in Cargo.toml, so it must match the tag.
+      - name: Bump Cargo version, commit and tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i "0,/^version = .*/s//version = \"${VERSION#v}\"/" Cargo.toml
+          cargo update --workspace
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): $VERSION"
+          git tag "$VERSION"
+          git push origin HEAD:main "$VERSION"
+
+      - name: Build release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          GENERATED=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            --method POST --field tag_name="$VERSION" --jq '.body')
+          CONTRIBUTORS=$(echo "$GENERATED" | awk '/^## New Contributors/{found=1} found{print}' | grep -v "^\*\*Full Changelog" || true)
+          FULL_CHANGELOG=$(echo "$GENERATED" | grep "^\*\*Full Changelog" || true)
+          {
+            echo "# db9s $VERSION"
+            echo ""
+            cat changelog_fragment.md
+            echo ""
+            [ -n "$CONTRIBUTORS" ] && { echo "$CONTRIBUTORS"; echo ""; }
+            [ -n "$FULL_CHANGELOG" ] && echo "$FULL_CHANGELOG"
+            true
+          } > release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body_path: release_body.md
+
+  binaries:
+    name: Build binaries
+    needs: create-release
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.create-release.outputs.version }}
+    permissions:
+      contents: write
+
+  publish:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
