@@ -25,7 +25,17 @@ jobs:
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'" --health-interval 5s --health-timeout 5s --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: db9s
+          RABBITMQ_DEFAULT_PASS: db9s
+        ports: ["15672:15672", "5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
+      DB9S_TEST_RABBITMQ_URL: http://db9s:db9s@localhost:15672
+      DB9S_TEST_AMQP_URL: amqp://db9s:db9s@localhost:5672/%2F
       DB9S_TEST_POSTGRES_URL: postgres://db9s:db9s@localhost:5432/db9s
       DB9S_TEST_MONGO_URL: mongodb://localhost:27017
     steps:

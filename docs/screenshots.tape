@@ -8,7 +8,7 @@ Set Padding 16
 
 Hide
 # empty HOME so saved user connections never end up in the screenshots
-Type "export HOME=$(mktemp -d) && clear && ./target/debug/db9s --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017"
+Type "export HOME=$(mktemp -d) && clear && ./target/debug/db9s --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017 --rabbitmq http://db9s:db9s@localhost:55672"
 Enter
 Sleep 3s
 Show
@@ -38,10 +38,20 @@ Type "j"
 Sleep 1s
 Screenshot docs/edit.png
 
+# discard the edit, back to connections, open rabbitmq
 Escape
 Sleep 300ms
 Escape
 Escape
 Escape
-Type "q"
 Sleep 500ms
+Type "jj"
+Enter
+Sleep 1s
+Enter
+Sleep 1s
+Type "j"
+Sleep 1s
+Tab
+Sleep 500ms
+Screenshot docs/rabbitmq.png

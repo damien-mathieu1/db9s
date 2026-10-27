@@ -30,7 +30,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_confirm_edit_popup(f, app);
     }
     if matches!(app.mode, Mode::ConfirmDelete) {
-        draw_confirm_popup(f, "delete this row/document?");
+        draw_confirm_popup(
+            f,
+            if app.is_queue() {
+                "purge every message in this queue?"
+            } else {
+                "delete this row/document?"
+            },
+        );
     }
     if matches!(app.mode, Mode::ConfirmDeleteConn) {
         let name = app
@@ -322,8 +329,12 @@ fn compact(v: &serde_json::Value) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if matches!(app.mode, Mode::Query) {
         f.render_widget(
-            Paragraph::new(format!("query> {}_", app.query_input))
-                .style(Style::default().fg(theme::SELECTED_FG)),
+            Paragraph::new(format!(
+                "{}> {}_",
+                if app.is_queue() { "publish" } else { "query" },
+                app.query_input
+            ))
+            .style(Style::default().fg(theme::SELECTED_FG)),
             area,
         );
         return;
@@ -507,7 +518,7 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
 }
 
 fn draw_add_conn_popup(f: &mut Frame, app: &App) {
-    use crate::app::{AddField, NewConnKind};
+    use crate::app::AddField;
 
     let area = centered(f.area(), 60, 40);
     f.render_widget(ratatui::widgets::Clear, area);
@@ -563,10 +574,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
             ),
         rows[1],
     );
-    let kind_label = match app.new_conn_kind {
-        NewConnKind::Postgres => "< postgres >",
-        NewConnKind::Mongo => "< mongo >",
-    };
+    let kind_label = format!("< {} >", app.new_conn_kind.label());
     f.render_widget(
         Paragraph::new(kind_label)
             .style(field_style(AddField::Kind))
