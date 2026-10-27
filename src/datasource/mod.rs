@@ -1,3 +1,4 @@
+pub mod amqp;
 pub mod mongo;
 pub mod postgres;
 pub mod rabbitmq;
@@ -19,6 +20,11 @@ pub struct QueryResult {
 /// database -> container (table/collection) -> rows/documents.
 #[async_trait]
 pub trait DataSource: Send + Sync {
+    /// Message brokers (rows = messages): `/` publishes, `d` purges, edit is disabled.
+    fn is_queue(&self) -> bool {
+        false
+    }
+
     async fn list_databases(&self) -> Result<Vec<String>>;
 
     /// Tables for postgres, collections for mongo.

@@ -2,19 +2,39 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ConnectionKind {
-    Postgres { url: String },
-    Mongo { url: String },
-    RabbitMq { url: String },
+/// Backend type. Adding one = a variant here (+ `ALL`/`label`), an arm in
+/// `app::connect()`, and a `DataSource` impl under `src/datasource/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Postgres,
+    Mongo,
+    /// `http(s)://` = management API, `amqp(s)://` = plain AMQP.
+    RabbitMq,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Postgres, Kind::Mongo, Kind::RabbitMq];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Kind::Postgres => "postgres",
+            Kind::Mongo => "mongo",
+            Kind::RabbitMq => "rabbitmq",
+        }
+    }
+
+    pub fn next(self) -> Kind {
+        let i = Kind::ALL.iter().position(|k| *k == self).unwrap();
+        Kind::ALL[(i + 1) % Kind::ALL.len()]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub name: String,
-    #[serde(flatten)]
-    pub kind: ConnectionKind,
+    pub kind: Kind,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -71,4 +91,41 @@ pub fn set_editor(editor: &str) -> Result<()> {
     let mut cfg = load().unwrap_or_default();
     cfg.editor = Some(editor.to_string());
     save(&cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_toml_format_is_stable() {
+        let cfg: Config = toml::from_str(
+            r#"
+            editor = "vi"
+            [[connections]]
+            name = "pg"
+            kind = "postgres"
+            url = "postgres://localhost/db"
+            [[connections]]
+            name = "rabbit"
+            kind = "rabbitmq"
+            url = "amqp://localhost/%2F?queues=q"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.connections[0].kind, Kind::Postgres);
+        assert_eq!(cfg.connections[1].kind, Kind::RabbitMq);
+        assert_eq!(cfg.connections[1].url, "amqp://localhost/%2F?queues=q");
+        let round_trip = toml::to_string(&cfg).unwrap();
+        assert!(round_trip.contains("kind = \"rabbitmq\""));
+    }
+
+    #[test]
+    fn kind_cycles_through_all() {
+        let mut k = Kind::ALL[0];
+        for _ in 0..Kind::ALL.len() {
+            k = k.next();
+        }
+        assert_eq!(k, Kind::ALL[0]);
+    }
 }

@@ -28,6 +28,7 @@ directories = "5"
 chrono = "0.4"
 uuid = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+lapin = { version = "4", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
 
 [profile.release]
 lto = true

@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, Kind};
 use crate::datasource::{DataSource, QueryResult};
 use crate::value::Row;
 use anyhow::Result;
@@ -52,13 +52,6 @@ pub struct EditorRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewConnKind {
-    Postgres,
-    Mongo,
-    RabbitMq,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddField {
     Name,
     Url,
@@ -67,19 +60,9 @@ pub enum AddField {
 
 pub struct ConnEntry {
     pub name: String,
-    pub kind: NewConnKind,
+    pub kind: Kind,
     pub url: String,
     pub source: Result<Box<dyn DataSource>>,
-}
-
-impl NewConnKind {
-    pub fn label(&self) -> &'static str {
-        match self {
-            NewConnKind::Postgres => "postgres",
-            NewConnKind::Mongo => "mongo",
-            NewConnKind::RabbitMq => "rabbitmq",
-        }
-    }
 }
 
 /// Masks the password portion of a connection string, e.g.
@@ -129,24 +112,23 @@ pub struct App {
 
     pub new_conn_name: String,
     pub new_conn_url: String,
-    pub new_conn_kind: NewConnKind,
+    pub new_conn_kind: Kind,
     pub new_conn_field: AddField,
     pub new_conn_error: Option<String>,
     pub edit_target: Option<usize>,
     pub connecting: Option<PendingConnect>,
 }
 
-async fn connect(kind: NewConnKind, url: &str) -> Result<Box<dyn DataSource>> {
+async fn connect(kind: Kind, url: &str) -> Result<Box<dyn DataSource>> {
     use crate::datasource::{
-        mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
+        amqp::AmqpSource, mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
     };
     let fut = async {
         Ok(match kind {
-            NewConnKind::Postgres => {
-                Box::new(PostgresSource::connect(url).await?) as Box<dyn DataSource>
-            }
-            NewConnKind::Mongo => Box::new(MongoSource::connect(url).await?),
-            NewConnKind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
+            Kind::Postgres => Box::new(PostgresSource::connect(url).await?) as Box<dyn DataSource>,
+            Kind::Mongo => Box::new(MongoSource::connect(url).await?),
+            Kind::RabbitMq if url.starts_with("amqp") => Box::new(AmqpSource::connect(url).await?),
+            Kind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
         })
     };
     tokio::time::timeout(CONNECT_TIMEOUT, fut)
@@ -159,14 +141,14 @@ async fn connect(kind: NewConnKind, url: &str) -> Result<Box<dyn DataSource>> {
         })
 }
 
-fn spawn_connect(kind: NewConnKind, url: String) -> JoinHandle<Result<Box<dyn DataSource>>> {
+fn spawn_connect(kind: Kind, url: String) -> JoinHandle<Result<Box<dyn DataSource>>> {
     tokio::spawn(async move { connect(kind, &url).await })
 }
 
 /// A connection attempt running in the background, so the UI never blocks on
 /// a slow or unreachable server; polled once per event-loop tick.
 pub struct PendingConnect {
-    kind: NewConnKind,
+    kind: Kind,
     name: String,
     url: String,
     save: bool,
@@ -184,20 +166,11 @@ impl App {
 
         // connect concurrently so N unreachable servers cost one timeout, not N
         let futs = cfg.connections.into_iter().map(|c| async move {
-            let (kind, url) = match &c.kind {
-                crate::config::ConnectionKind::Postgres { url } => {
-                    (NewConnKind::Postgres, url.clone())
-                }
-                crate::config::ConnectionKind::Mongo { url } => (NewConnKind::Mongo, url.clone()),
-                crate::config::ConnectionKind::RabbitMq { url } => {
-                    (NewConnKind::RabbitMq, url.clone())
-                }
-            };
-            let source = connect(kind, &url).await;
+            let source = connect(c.kind, &c.url).await;
             ConnEntry {
                 name: c.name,
-                kind,
-                url,
+                kind: c.kind,
+                url: c.url,
                 source,
             }
         });
@@ -233,7 +206,7 @@ impl App {
             settings_error: None,
             new_conn_name: String::new(),
             new_conn_url: String::new(),
-            new_conn_kind: NewConnKind::Postgres,
+            new_conn_kind: Kind::Postgres,
             new_conn_field: AddField::Name,
             new_conn_error: None,
             edit_target: None,
@@ -267,17 +240,12 @@ impl App {
 
     fn finalize_conn(
         &mut self,
-        kind: NewConnKind,
+        kind: Kind,
         name: String,
         url: String,
         source: Box<dyn DataSource>,
         edit_idx: Option<usize>,
     ) {
-        let cfg_kind = match kind {
-            NewConnKind::Postgres => crate::config::ConnectionKind::Postgres { url: url.clone() },
-            NewConnKind::Mongo => crate::config::ConnectionKind::Mongo { url: url.clone() },
-            NewConnKind::RabbitMq => crate::config::ConnectionKind::RabbitMq { url: url.clone() },
-        };
         if let Some(idx) = edit_idx {
             let old_name = self.conns[idx].name.clone();
             if old_name != name {
@@ -285,7 +253,8 @@ impl App {
             }
             if let Err(e) = crate::config::add_connection(crate::config::Connection {
                 name: name.clone(),
-                kind: cfg_kind,
+                kind,
+                url: url.clone(),
             }) {
                 self.status = format!("connected, but failed to save to config: {e}");
             } else {
@@ -301,7 +270,8 @@ impl App {
         } else {
             if let Err(e) = crate::config::add_connection(crate::config::Connection {
                 name: name.clone(),
-                kind: cfg_kind,
+                kind,
+                url: url.clone(),
             }) {
                 self.status = format!("connected, but failed to save to config: {e}");
             } else {
@@ -440,7 +410,7 @@ impl App {
 
     /// Queues (RabbitMQ) get publish/purge instead of edit/delete.
     pub fn is_queue(&self) -> bool {
-        self.conns.get(self.conn_idx).map(|c| c.kind) == Some(NewConnKind::RabbitMq)
+        self.current_source().is_some_and(|s| s.is_queue())
     }
 
     fn rows_focused(&self) -> bool {
@@ -812,7 +782,7 @@ impl App {
     fn start_add_conn(&mut self) {
         self.new_conn_name.clear();
         self.new_conn_url.clear();
-        self.new_conn_kind = NewConnKind::Postgres;
+        self.new_conn_kind = Kind::Postgres;
         self.new_conn_field = AddField::Name;
         self.new_conn_error = None;
         self.edit_target = None;
@@ -884,11 +854,7 @@ impl App {
                 };
             }
             KeyCode::Left | KeyCode::Right if self.new_conn_field == AddField::Kind => {
-                self.new_conn_kind = match self.new_conn_kind {
-                    NewConnKind::Postgres => NewConnKind::Mongo,
-                    NewConnKind::Mongo => NewConnKind::RabbitMq,
-                    NewConnKind::RabbitMq => NewConnKind::Postgres,
-                };
+                self.new_conn_kind = self.new_conn_kind.next();
             }
             KeyCode::Enter => {
                 if self.new_conn_field != AddField::Kind {

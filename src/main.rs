@@ -42,19 +42,22 @@ async fn main() -> Result<()> {
     if let Some(url) = args.postgres {
         cfg.connections.push(config::Connection {
             name: "postgres".into(),
-            kind: config::ConnectionKind::Postgres { url },
+            kind: config::Kind::Postgres,
+            url,
         });
     }
     if let Some(url) = args.mongo {
         cfg.connections.push(config::Connection {
             name: "mongo".into(),
-            kind: config::ConnectionKind::Mongo { url },
+            kind: config::Kind::Mongo,
+            url,
         });
     }
     if let Some(url) = args.rabbitmq {
         cfg.connections.push(config::Connection {
             name: "rabbitmq".into(),
-            kind: config::ConnectionKind::RabbitMq { url },
+            kind: config::Kind::RabbitMq,
+            url,
         });
     }
 

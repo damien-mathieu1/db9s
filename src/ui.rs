@@ -518,7 +518,7 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
 }
 
 fn draw_add_conn_popup(f: &mut Frame, app: &App) {
-    use crate::app::{AddField, NewConnKind};
+    use crate::app::AddField;
 
     let area = centered(f.area(), 60, 40);
     f.render_widget(ratatui::widgets::Clear, area);
@@ -574,11 +574,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
             ),
         rows[1],
     );
-    let kind_label = match app.new_conn_kind {
-        NewConnKind::Postgres => "< postgres >",
-        NewConnKind::Mongo => "< mongo >",
-        NewConnKind::RabbitMq => "< rabbitmq >",
-    };
+    let kind_label = format!("< {} >", app.new_conn_kind.label());
     f.render_widget(
         Paragraph::new(kind_label)
             .style(field_style(AddField::Kind))

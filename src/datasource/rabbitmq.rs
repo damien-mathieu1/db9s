@@ -86,6 +86,10 @@ impl RabbitMqSource {
 
 #[async_trait]
 impl DataSource for RabbitMqSource {
+    fn is_queue(&self) -> bool {
+        true
+    }
+
     async fn list_databases(&self) -> Result<Vec<String>> {
         Ok(Self::names(self.get(&["vhosts"]).await?))
     }
