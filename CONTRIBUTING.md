@@ -34,17 +34,16 @@ a seed file in `dev/`, and a service in `docker-compose.yml` and CI.
 
 ## Releasing
 
-Bump `version` in `Cargo.toml`, merge to `main`, then tag:
+Versions are CalVer `vYYYY.M.N` (N = release number in the month). To release,
+go to **Actions → Create Release → Run workflow** on `main`. It:
 
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-The tag triggers two workflows:
-
-- `ci`: runs the tests against real databases, then publishes to crates.io
-  (needs the `CARGO_REGISTRY_TOKEN` repo secret). Nothing is published if a test fails.
-- `release`: builds Linux/macOS/Windows binaries and attaches them to a GitHub Release.
+1. runs the CI tests against real databases (nothing happens if they fail),
+2. computes the next version, bumps `Cargo.toml`, commits `chore(release): vX`
+   to `main` and tags it,
+3. creates the GitHub Release with a changelog built from conventional commits
+   (`cliff.toml`, same as git-cliff),
+4. builds Linux/macOS/Windows binaries and attaches them to the release,
+5. publishes to crates.io (needs the `CARGO_REGISTRY_TOKEN` repo secret).
 
 ## Screenshots
 
