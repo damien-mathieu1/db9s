@@ -4,8 +4,12 @@
 //! Each backend is skipped unless its URL env var is set, e.g. with the dev stack:
 //!   DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
 //!   DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
-//!   DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 cargo test
-use super::{mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource, DataSource};
+//!   DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
+//!   DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F cargo test
+use super::{
+    amqp::AmqpSource, mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
+    DataSource,
+};
 use serde_json::json;
 
 fn unique(prefix: &str) -> String {
@@ -114,6 +118,56 @@ async fn mongo_conformance() {
     coll.drop().await.unwrap();
 }
 
+/// Same broker scenario for every queue backend: publish, peek without consuming,
+/// paginate, read-only edit, purge. Expects `queue` to exist, empty, in vhost "/".
+async fn exercise_queue(source: &dyn DataSource, queue: &str) {
+    assert!(source.is_queue());
+    assert!(source
+        .list_databases()
+        .await
+        .unwrap()
+        .contains(&"/".to_string()));
+    assert!(source
+        .list_containers("/")
+        .await
+        .unwrap()
+        .iter()
+        .any(|q| q == queue));
+
+    for payload in ["hello", "world"] {
+        let res = source.run_query("/", queue, payload).await.unwrap();
+        assert_eq!(res.affected, Some(1));
+    }
+
+    let res = source.fetch_rows("/", queue, 10, 0).await.unwrap();
+    assert!(res.columns.iter().any(|c| c == "payload"));
+    let payloads: Vec<_> = res.rows.iter().map(|r| r["payload"].clone()).collect();
+    assert_eq!(payloads, vec![json!("hello"), json!("world")]);
+    // peeking requeues, so the messages are still there
+    assert_eq!(
+        source
+            .fetch_rows("/", queue, 10, 0)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    let paged = source.fetch_rows("/", queue, 1, 1).await.unwrap();
+    assert_eq!(paged.rows[0]["payload"], json!("world"));
+
+    let row = &res.rows[0];
+    assert!(source.update_row("/", queue, row, row).await.is_err());
+
+    source.delete_row("/", queue, row).await.unwrap();
+    assert!(source
+        .fetch_rows("/", queue, 10, 0)
+        .await
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
 /// Queues don't fit the row scenario (no per-message edit/delete), so RabbitMQ gets
 /// its own: publish, peek without consuming, paginate, read-only edit, purge.
 #[tokio::test]
@@ -153,49 +207,45 @@ async fn rabbitmq_conformance() {
         .error_for_status()
         .unwrap();
 
-    assert!(source
-        .list_databases()
-        .await
-        .unwrap()
-        .contains(&"/".to_string()));
-    assert!(source.list_containers("/").await.unwrap().contains(&queue));
-
-    for payload in ["hello", "world"] {
-        let res = source.run_query("/", &queue, payload).await.unwrap();
-        assert_eq!(res.affected, Some(1));
-    }
-
-    let res = source.fetch_rows("/", &queue, 10, 0).await.unwrap();
-    assert!(res.columns.iter().any(|c| c == "payload"));
-    let payloads: Vec<_> = res.rows.iter().map(|r| r["payload"].clone()).collect();
-    assert_eq!(payloads, vec![json!("hello"), json!("world")]);
-    // peeking requeues, so the messages are still there
-    assert_eq!(
-        source
-            .fetch_rows("/", &queue, 10, 0)
-            .await
-            .unwrap()
-            .rows
-            .len(),
-        2
-    );
-    let paged = source.fetch_rows("/", &queue, 1, 1).await.unwrap();
-    assert_eq!(paged.rows[0]["payload"], json!("world"));
-
-    let row = &res.rows[0];
-    assert!(source.update_row("/", &queue, row, row).await.is_err());
-
-    source.delete_row("/", &queue, row).await.unwrap();
-    assert!(source
-        .fetch_rows("/", &queue, 10, 0)
-        .await
-        .unwrap()
-        .rows
-        .is_empty());
+    exercise_queue(&source, &queue).await;
 
     http.delete(queue_url)
         .basic_auth(&auth.0, auth.1.as_ref())
         .send()
         .await
         .unwrap();
+}
+
+/// RabbitMQ without the management plugin: plain AMQP through lapin.
+#[tokio::test]
+async fn amqp_conformance() {
+    let Ok(url) = std::env::var("DB9S_TEST_AMQP_URL") else {
+        eprintln!("skipped: DB9S_TEST_AMQP_URL not set");
+        return;
+    };
+    let queue = unique("db9s_test");
+    let conn = lapin::Connection::connect(&url, lapin::ConnectionProperties::default())
+        .await
+        .unwrap();
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare(
+        queue.as_str().into(),
+        lapin::options::QueueDeclareOptions::default(),
+        lapin::types::FieldTable::default(),
+    )
+    .await
+    .unwrap();
+
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let source = AmqpSource::connect(&format!("{url}{sep}queues={queue}"))
+        .await
+        .unwrap();
+    exercise_queue(&source, &queue).await;
+
+    ch.queue_delete(
+        queue.as_str().into(),
+        lapin::options::QueueDeleteOptions::default(),
+    )
+    .await
+    .unwrap();
 }

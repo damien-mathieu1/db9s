@@ -24,6 +24,7 @@ services:
       RABBITMQ_DEFAULT_PASS: db9s
     ports:
       - "55672:15672"
+      - "55673:5672"
 
   rabbitmq-seed:
     image: curlimages/curl:8.11.1
