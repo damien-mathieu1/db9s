@@ -1,6 +1,6 @@
 <div align="center">
 <h1>db9s</h1>
-A k9s-style terminal UI to browse, query, and edit your databases 🦀
+A k9s-style terminal UI to browse, query, and edit your databases and message queues 🦀
 
 ![db9s](./docs/browse.png)
 
@@ -25,6 +25,7 @@ Or grab a prebuilt binary (Linux, macOS, Windows) from the
 |---|---|
 | PostgreSQL | 🟢 Supported |
 | MongoDB | 🟢 Supported |
+| RabbitMQ | 🟢 Supported |
 | MySQL / MariaDB | 🔴 Planned |
 | SQLite | 🔴 Planned |
 | Redis | 🔴 Planned |
@@ -40,6 +41,7 @@ Every backend gets the same screens and keys. Want one sooner? See
 ```bash
 db9s --postgres postgres://user:pass@localhost/db
 db9s --mongo mongodb://localhost:27017
+db9s --rabbitmq http://guest:guest@localhost:15672   # management API url
 ```
 
 Or just run `db9s` and add connections from the TUI (`a`). They are saved to
@@ -55,6 +57,11 @@ url = "postgres://user:pass@localhost/db"
 name = "local mongo"
 kind = "mongo"
 url = "mongodb://localhost:27017"
+
+[[connections]]
+name = "local rabbit"
+kind = "rabbitmq"
+url = "http://guest:guest@localhost:15672"
 
 editor = "nvim"  # optional, for `E` — defaults to $EDITOR, then vi
 ```
@@ -78,6 +85,18 @@ The footer always shows the keys available where you are.
 
 ![inline edit](./docs/edit.png)
 
+### RabbitMQ
+
+Same screens, mapped onto the management API: databases are **vhosts**,
+containers are **queues**, rows are **messages**.
+
+- Messages are peeked, not consumed: they stay in the queue, but RabbitMQ marks
+  them as redelivered.
+- `/` publishes a message to the queue, `d` purges the whole queue (a single
+  message can't be removed), `e`/`E` are disabled: messages are read-only.
+
+![rabbitmq](./docs/rabbitmq.png)
+
 ## Notes
 
 - Row edit/delete on Postgres needs a primary key column named `id`.
@@ -85,7 +104,7 @@ The footer always shows the keys available where you are.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md): local Postgres + Mongo with seed data,
+See [CONTRIBUTING.md](CONTRIBUTING.md): local Postgres, Mongo and RabbitMQ with seed data,
 conformance tests for every backend, and how releases work.
 
 ## License

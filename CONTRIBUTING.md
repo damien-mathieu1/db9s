@@ -5,9 +5,10 @@ Issues and PRs are welcome.
 ## Dev setup
 
 ```bash
-docker compose up -d          # local postgres + mongo, seeded with `users` and `products` (dev/seed.sql, dev/seed.js)
+docker compose up -d          # local postgres + mongo + rabbitmq, seeded (dev/seed.sql, dev/seed.js, dev/seed-rabbitmq.sh)
 docker compose down -v        # wipe data; next `up` re-seeds
-cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017
+cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017 \
+  --rabbitmq http://db9s:db9s@localhost:55672
 ```
 
 ## Before opening a PR
@@ -16,12 +17,14 @@ cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongod
 cargo fmt
 cargo clippy --all-targets
 DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
-DB9S_TEST_MONGO_URL=mongodb://localhost:57017 cargo test
+DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
+DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 cargo test
 ```
 
 `src/datasource/tests.rs` runs the same scenario (list, page, update, query,
-delete) against every backend; a backend without its URL env var is skipped.
-CI runs them all against real Postgres and MongoDB.
+delete) against every database backend; RabbitMQ has its own test (publish,
+peek, purge) since queues have no per-message edit/delete. A backend without
+its URL env var is skipped. CI runs them all against real services.
 
 Keep the diff focused on one change. No unused code, no new warnings.
 
