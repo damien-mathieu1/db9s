@@ -33,7 +33,13 @@ jobs:
         ports: ["15672:15672", "5672:5672"]
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      DB9S_TEST_REDIS_URL: redis://localhost:6379
       DB9S_TEST_RABBITMQ_URL: http://db9s:db9s@localhost:15672
       DB9S_TEST_AMQP_URL: amqp://db9s:db9s@localhost:5672/%2F
       DB9S_TEST_POSTGRES_URL: postgres://db9s:db9s@localhost:5432/db9s
