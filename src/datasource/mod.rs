@@ -1,5 +1,6 @@
 pub mod mongo;
 pub mod postgres;
+pub mod rabbitmq;
 #[cfg(test)]
 mod tests;
 

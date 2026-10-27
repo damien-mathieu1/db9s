@@ -55,6 +55,7 @@ pub struct EditorRequest {
 pub enum NewConnKind {
     Postgres,
     Mongo,
+    RabbitMq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,7 @@ impl NewConnKind {
         match self {
             NewConnKind::Postgres => "postgres",
             NewConnKind::Mongo => "mongo",
+            NewConnKind::RabbitMq => "rabbitmq",
         }
     }
 }
@@ -135,31 +137,26 @@ pub struct App {
 }
 
 async fn connect(kind: NewConnKind, url: &str) -> Result<Box<dyn DataSource>> {
-    let timed_out = || anyhow::anyhow!("connection timed out after {}s", CONNECT_TIMEOUT.as_secs());
-    match kind {
-        NewConnKind::Postgres => {
-            match tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                crate::datasource::postgres::PostgresSource::connect(url),
-            )
-            .await
-            {
-                Ok(res) => res.map(|s| Box::new(s) as Box<dyn DataSource>),
-                Err(_) => Err(timed_out()),
+    use crate::datasource::{
+        mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
+    };
+    let fut = async {
+        Ok(match kind {
+            NewConnKind::Postgres => {
+                Box::new(PostgresSource::connect(url).await?) as Box<dyn DataSource>
             }
-        }
-        NewConnKind::Mongo => {
-            match tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                crate::datasource::mongo::MongoSource::connect(url),
-            )
-            .await
-            {
-                Ok(res) => res.map(|s| Box::new(s) as Box<dyn DataSource>),
-                Err(_) => Err(timed_out()),
-            }
-        }
-    }
+            NewConnKind::Mongo => Box::new(MongoSource::connect(url).await?),
+            NewConnKind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
+        })
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "connection timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        })
 }
 
 fn spawn_connect(kind: NewConnKind, url: String) -> JoinHandle<Result<Box<dyn DataSource>>> {
@@ -192,6 +189,9 @@ impl App {
                     (NewConnKind::Postgres, url.clone())
                 }
                 crate::config::ConnectionKind::Mongo { url } => (NewConnKind::Mongo, url.clone()),
+                crate::config::ConnectionKind::RabbitMq { url } => {
+                    (NewConnKind::RabbitMq, url.clone())
+                }
             };
             let source = connect(kind, &url).await;
             ConnEntry {
@@ -276,6 +276,7 @@ impl App {
         let cfg_kind = match kind {
             NewConnKind::Postgres => crate::config::ConnectionKind::Postgres { url: url.clone() },
             NewConnKind::Mongo => crate::config::ConnectionKind::Mongo { url: url.clone() },
+            NewConnKind::RabbitMq => crate::config::ConnectionKind::RabbitMq { url: url.clone() },
         };
         if let Some(idx) = edit_idx {
             let old_name = self.conns[idx].name.clone();
@@ -383,6 +384,9 @@ impl App {
                 self.mode = Mode::Query;
                 self.query_input.clear();
             }
+            KeyCode::Char('e') | KeyCode::Char('E') if self.rows_focused() && self.is_queue() => {
+                self.status = "rabbitmq messages are read-only".into();
+            }
             KeyCode::Char('e') if self.rows_focused() => self.start_field_edit(),
             KeyCode::Char('E') if self.rows_focused() => self.start_edit(),
             KeyCode::Char('d') if self.rows_focused() && self.selected_row().is_some() => {
@@ -412,6 +416,9 @@ impl App {
             Screen::Databases => "j/k move  enter open  esc back",
             Screen::Browse => match self.browse_focus {
                 BrowseFocus::Containers => "j/k move+preview  enter/tab rows  esc back",
+                BrowseFocus::Rows if self.is_queue() => {
+                    "j/k move  / publish  d purge queue  n/p page  r refresh  tab queues  esc back"
+                }
                 BrowseFocus::Rows => {
                     "j/k move  e edit  E $EDITOR  d delete  / query  n/p page  r refresh  tab containers  esc back"
                 }
@@ -429,6 +436,11 @@ impl App {
 
     fn selected_row(&self) -> Option<&Row> {
         self.result.as_ref().and_then(|r| r.rows.get(self.row_idx))
+    }
+
+    /// Queues (RabbitMQ) get publish/purge instead of edit/delete.
+    pub fn is_queue(&self) -> bool {
+        self.conns.get(self.conn_idx).map(|c| c.kind) == Some(NewConnKind::RabbitMq)
     }
 
     fn rows_focused(&self) -> bool {
@@ -576,6 +588,7 @@ impl App {
                     Ok(res) => {
                         self.row_idx = 0;
                         self.status = match res.affected {
+                            Some(_) if self.is_queue() => "message published".into(),
                             Some(n) => format!("{n} rows affected"),
                             None => format!("{} rows", res.rows.len()),
                         };
@@ -873,7 +886,8 @@ impl App {
             KeyCode::Left | KeyCode::Right if self.new_conn_field == AddField::Kind => {
                 self.new_conn_kind = match self.new_conn_kind {
                     NewConnKind::Postgres => NewConnKind::Mongo,
-                    NewConnKind::Mongo => NewConnKind::Postgres,
+                    NewConnKind::Mongo => NewConnKind::RabbitMq,
+                    NewConnKind::RabbitMq => NewConnKind::Postgres,
                 };
             }
             KeyCode::Enter => {

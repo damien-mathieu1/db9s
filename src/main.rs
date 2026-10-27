@@ -19,7 +19,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "db9s",
-    about = "k9s-style TUI browser for Postgres and MongoDB"
+    about = "k9s-style TUI browser for Postgres, MongoDB and RabbitMQ"
 )]
 struct Args {
     /// One-off postgres connection url, added as a connection named "postgres"
@@ -28,6 +28,10 @@ struct Args {
     /// One-off mongo connection url, added as a connection named "mongo"
     #[arg(long)]
     mongo: Option<String>,
+    /// One-off RabbitMQ management API url (e.g. http://guest:guest@localhost:15672),
+    /// added as a connection named "rabbitmq"
+    #[arg(long)]
+    rabbitmq: Option<String>,
 }
 
 #[tokio::main]
@@ -45,6 +49,12 @@ async fn main() -> Result<()> {
         cfg.connections.push(config::Connection {
             name: "mongo".into(),
             kind: config::ConnectionKind::Mongo { url },
+        });
+    }
+    if let Some(url) = args.rabbitmq {
+        cfg.connections.push(config::Connection {
+            name: "rabbitmq".into(),
+            kind: config::ConnectionKind::RabbitMq { url },
         });
     }
 

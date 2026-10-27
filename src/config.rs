@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum ConnectionKind {
     Postgres { url: String },
     Mongo { url: String },
+    RabbitMq { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
