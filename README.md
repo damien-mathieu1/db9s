@@ -82,7 +82,9 @@ editor = "nvim"  # optional, for `E` — defaults to $EDITOR, then vi
 | `r` | refresh |
 | `a` / `e` / `d` / `s` | connections screen: add / edit / delete a connection, settings |
 
-The footer always shows the keys available where you are.
+The footer always shows the keys available where you are. In any text field:
+`←`/`→` move the cursor, `home`/`end` (or `ctrl+a`/`ctrl+e`) jump, `delete`
+removes forward, `ctrl+u` clears before the cursor.
 
 ![inline edit](./docs/edit.png)
 

@@ -1,5 +1,6 @@
 use crate::config::{Config, Kind};
 use crate::datasource::{DataSource, QueryResult};
+use crate::input::Input;
 use crate::value::Row;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -41,7 +42,7 @@ pub struct FieldEdit {
     pub edited: Row,
     pub idx: usize,
     /// `Some` while the selected field's value is being typed.
-    pub input: Option<String>,
+    pub input: Option<Input>,
 }
 
 /// A row/document sent out to the user's $EDITOR; picked up by the main loop
@@ -99,7 +100,7 @@ pub struct App {
     pub result: Option<QueryResult>,
     pub offset: i64,
 
-    pub query_input: String,
+    pub query_input: Input,
     pub status: String,
     pub should_quit: bool,
 
@@ -107,11 +108,11 @@ pub struct App {
     pub pending_edit: Option<(Row, Row)>,
     pub field_edit: Option<FieldEdit>,
     pub editor_cmd: String,
-    pub settings_editor_input: String,
+    pub settings_editor_input: Input,
     pub settings_error: Option<String>,
 
-    pub new_conn_name: String,
-    pub new_conn_url: String,
+    pub new_conn_name: Input,
+    pub new_conn_url: Input,
     pub new_conn_kind: Kind,
     pub new_conn_field: AddField,
     pub new_conn_error: Option<String>,
@@ -195,17 +196,17 @@ impl App {
             containers: vec![],
             result: None,
             offset: 0,
-            query_input: String::new(),
+            query_input: Input::default(),
             status: String::new(),
             should_quit: false,
             editor_request: None,
             pending_edit: None,
             field_edit: None,
             editor_cmd: editor_cmd.clone(),
-            settings_editor_input: editor_cmd,
+            settings_editor_input: Input::new(editor_cmd),
             settings_error: None,
-            new_conn_name: String::new(),
-            new_conn_url: String::new(),
+            new_conn_name: Input::default(),
+            new_conn_url: Input::default(),
             new_conn_kind: Kind::Postgres,
             new_conn_field: AddField::Name,
             new_conn_error: None,
@@ -352,7 +353,7 @@ impl App {
             }
             KeyCode::Char('/') if self.rows_focused() => {
                 self.mode = Mode::Query;
-                self.query_input.clear();
+                self.query_input = Input::default();
             }
             KeyCode::Char('e') | KeyCode::Char('E') if self.rows_focused() && self.is_queue() => {
                 self.status = "rabbitmq messages are read-only".into();
@@ -376,7 +377,7 @@ impl App {
     pub fn key_hints(&self) -> &'static str {
         if let Some(fe) = &self.field_edit {
             return if fe.input.is_some() {
-                "enter apply  esc cancel  (42, true, null, {..} keep their type; \"..\" forces text)"
+                "←/→ move  enter apply  esc cancel  42/true/null/{..} keep_type  \"..\" forces_text"
             } else {
                 "j/k move  enter edit field  ctrl+s save  esc discard"
             };
@@ -546,7 +547,7 @@ impl App {
             KeyCode::Enter => {
                 let db = self.current_db().unwrap_or_default().to_string();
                 let container = self.current_container().unwrap_or_default().to_string();
-                let raw = self.query_input.clone();
+                let raw = self.query_input.value().to_string();
                 self.mode = Mode::Normal;
                 self.status = "running query...".into();
                 match self
@@ -567,11 +568,9 @@ impl App {
                     Err(e) => self.status = format!("error: {e}"),
                 }
             }
-            KeyCode::Backspace => {
-                self.query_input.pop();
+            _ => {
+                self.query_input.handle(key);
             }
-            KeyCode::Char(c) => self.query_input.push(c),
-            _ => {}
         }
     }
 
@@ -620,18 +619,16 @@ impl App {
                 KeyCode::Enter => {
                     let before = crate::value::value_to_input(&fe.edited[&field]);
                     // untouched text keeps its original type (string "42" stays a string)
-                    if *input != before {
-                        let v = crate::value::input_to_value(input);
+                    if input.value() != before {
+                        let v = crate::value::input_to_value(input.value());
                         fe.edited.insert(field, v);
                     }
                     fe.input = None;
                 }
                 KeyCode::Esc => fe.input = None,
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    input.handle(key);
                 }
-                KeyCode::Char(c) => input.push(c),
-                _ => {}
             }
             return;
         }
@@ -641,7 +638,9 @@ impl App {
                 fe.idx = (fe.idx + 1).min(fe.edited.len().saturating_sub(1))
             }
             KeyCode::Char('k') | KeyCode::Up => fe.idx = fe.idx.saturating_sub(1),
-            KeyCode::Enter => fe.input = Some(crate::value::value_to_input(&fe.edited[&field])),
+            KeyCode::Enter => {
+                fe.input = Some(Input::new(crate::value::value_to_input(&fe.edited[&field])))
+            }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let fe = self.field_edit.take().unwrap();
                 self.mode = Mode::Normal;
@@ -746,7 +745,7 @@ impl App {
     }
 
     fn start_settings(&mut self) {
-        self.settings_editor_input = self.editor_cmd.clone();
+        self.settings_editor_input = Input::new(self.editor_cmd.clone());
         self.settings_error = None;
         self.mode = Mode::Settings;
     }
@@ -757,7 +756,7 @@ impl App {
                 self.mode = Mode::Normal;
             }
             KeyCode::Enter => {
-                let value = self.settings_editor_input.trim().to_string();
+                let value = self.settings_editor_input.value().trim().to_string();
                 if value.is_empty() {
                     self.settings_error = Some("editor command cannot be empty".into());
                     return;
@@ -771,17 +770,15 @@ impl App {
                     Err(e) => self.settings_error = Some(format!("failed to save: {e}")),
                 }
             }
-            KeyCode::Backspace => {
-                self.settings_editor_input.pop();
+            _ => {
+                self.settings_editor_input.handle(key);
             }
-            KeyCode::Char(c) => self.settings_editor_input.push(c),
-            _ => {}
         }
     }
 
     fn start_add_conn(&mut self) {
-        self.new_conn_name.clear();
-        self.new_conn_url.clear();
+        self.new_conn_name = Input::default();
+        self.new_conn_url = Input::default();
         self.new_conn_kind = Kind::Postgres;
         self.new_conn_field = AddField::Name;
         self.new_conn_error = None;
@@ -793,8 +790,8 @@ impl App {
         let Some(entry) = self.conns.get(self.conn_idx) else {
             return;
         };
-        self.new_conn_name = entry.name.clone();
-        self.new_conn_url = entry.url.clone();
+        self.new_conn_name = Input::new(entry.name.clone());
+        self.new_conn_url = Input::new(entry.url.clone());
         self.new_conn_kind = entry.kind;
         self.new_conn_field = AddField::Name;
         self.new_conn_error = None;
@@ -867,28 +864,22 @@ impl App {
                     self.start_submit_conn();
                 }
             }
-            KeyCode::Backspace => match self.new_conn_field {
+            _ => match self.new_conn_field {
                 AddField::Name => {
-                    self.new_conn_name.pop();
+                    self.new_conn_name.handle(key);
                 }
                 AddField::Url => {
-                    self.new_conn_url.pop();
+                    self.new_conn_url.handle(key);
                 }
                 AddField::Kind => {}
             },
-            KeyCode::Char(c) => match self.new_conn_field {
-                AddField::Name => self.new_conn_name.push(c),
-                AddField::Url => self.new_conn_url.push(c),
-                AddField::Kind => {}
-            },
-            _ => {}
         }
     }
 
     /// Validates the form and returns (name, url), or sets new_conn_error and returns None.
     fn validate_conn_form(&mut self) -> Option<(String, String)> {
-        let name = self.new_conn_name.trim().to_string();
-        let url = self.new_conn_url.trim().to_string();
+        let name = self.new_conn_name.value().trim().to_string();
+        let url = self.new_conn_url.value().trim().to_string();
         if name.is_empty() || url.is_empty() {
             self.new_conn_error = Some("name and url are required".into());
             return None;
