@@ -41,7 +41,8 @@ Every backend gets the same screens and keys. Want one sooner? See
 ```bash
 db9s --postgres postgres://user:pass@localhost/db
 db9s --mongo mongodb://localhost:27017
-db9s --rabbitmq http://guest:guest@localhost:15672   # management API url
+db9s --rabbitmq http://guest:guest@localhost:15672             # management API
+db9s --rabbitmq 'amqp://guest:guest@localhost:5672/%2F?queues=orders,emails'  # plain AMQP
 ```
 
 Or just run `db9s` and add connections from the TUI (`a`). They are saved to
@@ -87,8 +88,13 @@ The footer always shows the keys available where you are.
 
 ### RabbitMQ
 
-Same screens, mapped onto the management API: databases are **vhosts**,
-containers are **queues**, rows are **messages**.
+Same screens: databases are **vhosts**, containers are **queues**, rows are
+**messages**. Two ways to connect, picked from the URL scheme:
+
+| URL | Uses | Lists |
+|---|---|---|
+| `http(s)://user:pass@host:15672` | management API (plugin `rabbitmq_management`) | every vhost and queue |
+| `amqp(s)://user:pass@host:5672/<vhost>?queues=a,b` | plain AMQP ([lapin](https://github.com/amqp-rs/lapin)), no plugin needed | the vhost in the URL, the queues in `queues=` (AMQP can't list them) |
 
 - Messages are peeked, not consumed: they stay in the queue, but RabbitMQ marks
   them as redelivered.

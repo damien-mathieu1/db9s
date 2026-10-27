@@ -18,22 +18,29 @@ cargo fmt
 cargo clippy --all-targets
 DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
 DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
-DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 cargo test
+DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
+DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F cargo test
 ```
 
 `src/datasource/tests.rs` runs the same scenario (list, page, update, query,
-delete) against every database backend; RabbitMQ has its own test (publish,
-peek, purge) since queues have no per-message edit/delete. A backend without
+delete) against every database backend, and `exercise_queue()` runs the broker
+scenario (publish, peek, purge) against every queue backend (RabbitMQ over the
+management API and over AMQP). A backend without
 its URL env var is skipped. CI runs them all against real services.
 
 Keep the diff focused on one change. No unused code, no new warnings.
 
 ## Adding a backend
 
-Implement the `DataSource` trait (`src/datasource/mod.rs`) in a new module
-under `src/datasource/`, then wire it into `NewConnKind` and the `connect()`
-helper in `src/app.rs`. Add a `<backend>_conformance` test calling `exercise()`,
-a seed file in `dev/`, and a service in `docker-compose.yml` and CI.
+1. Implement the `DataSource` trait (`src/datasource/mod.rs`) in a new module
+   under `src/datasource/`. Message brokers (Kafka, NATS, ...) return `true`
+   from `is_queue()`: the UI then shows publish/purge and disables edit.
+2. Add a variant to `Kind` in `src/config.rs` (and to `Kind::ALL` / `label()`),
+   then an arm in `connect()` in `src/app.rs`. The add-connection form, config
+   file and footer hints pick it up from there.
+3. Add a `<backend>_conformance` test calling `exercise()` (databases) or
+   `exercise_queue()` (brokers), a seed in `dev/`, and a service in
+   `docker-compose.yml` and CI.
 
 ## Releasing
 
