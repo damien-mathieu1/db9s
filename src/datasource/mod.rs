@@ -2,6 +2,7 @@ pub mod amqp;
 pub mod mongo;
 pub mod postgres;
 pub mod rabbitmq;
+pub mod redis;
 #[cfg(test)]
 mod tests;
 
