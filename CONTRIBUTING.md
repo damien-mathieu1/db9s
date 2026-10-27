@@ -40,6 +40,17 @@ Bump `version` in `Cargo.toml`, merge to `main`, then tag:
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-The `release` workflow builds Linux/macOS/Windows binaries, attaches them to a
-GitHub Release, and publishes to crates.io if the `CARGO_REGISTRY_TOKEN` repo
-secret is set.
+The tag triggers two workflows:
+
+- `ci`: runs the tests against real databases, then publishes to crates.io
+  (needs the `CARGO_REGISTRY_TOKEN` repo secret). Nothing is published if a test fails.
+- `release`: builds Linux/macOS/Windows binaries and attaches them to a GitHub Release.
+
+## Screenshots
+
+`docs/*.png` are generated with [vhs](https://github.com/charmbracelet/vhs) from
+`docs/screenshots.tape`, against the seeded `docker compose` stack:
+
+```bash
+docker compose up -d && cargo build && vhs docs/screenshots.tape
+```
