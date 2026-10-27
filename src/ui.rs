@@ -206,14 +206,14 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit) {
         .map(|(i, (k, v))| {
             let changed = fe.original.get(k) != Some(v);
             let value = match (&fe.input, i == fe.idx) {
-                (Some(input), true) => format!("{input}_"),
-                _ => compact(v),
+                (Some(input), true) => input.spans(true),
+                _ => vec![Span::raw(compact(v))],
             };
             let mut style = Style::default();
             if i == fe.idx {
                 style = selected_style();
             }
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if changed { "● " } else { "  " },
                     Style::default().fg(theme::CONFIRM),
@@ -224,9 +224,9 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit) {
                         .fg(theme::DOC_TEXT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(value),
-            ]))
-            .style(style)
+            ];
+            spans.extend(value);
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
     let list = List::new(items).block(
@@ -329,10 +329,16 @@ fn compact(v: &serde_json::Value) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if matches!(app.mode, Mode::Query) {
         f.render_widget(
-            Paragraph::new(format!(
-                "{}> {}_",
-                if app.is_queue() { "publish" } else { "query" },
-                app.query_input
+            Paragraph::new(Line::from(
+                [
+                    vec![Span::raw(if app.is_queue() {
+                        "publish> "
+                    } else {
+                        "query> "
+                    })],
+                    app.query_input.spans(true),
+                ]
+                .concat(),
             ))
             .style(Style::default().fg(theme::SELECTED_FG)),
             area,
@@ -492,7 +498,7 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
         .split(inner);
 
     f.render_widget(
-        Paragraph::new(app.settings_editor_input.as_str())
+        Paragraph::new(Line::from(app.settings_editor_input.spans(true)))
             .style(selected_style())
             .block(
                 Block::default()
@@ -553,25 +559,30 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
     };
 
     f.render_widget(
-        Paragraph::new(app.new_conn_name.as_str())
-            .style(field_style(AddField::Name))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(theme::BORDER_TYPE)
-                    .title("name"),
-            ),
+        Paragraph::new(Line::from(
+            app.new_conn_name
+                .spans(app.new_conn_field == AddField::Name),
+        ))
+        .style(field_style(AddField::Name))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(theme::BORDER_TYPE)
+                .title("name"),
+        ),
         rows[0],
     );
     f.render_widget(
-        Paragraph::new(app.new_conn_url.as_str())
-            .style(field_style(AddField::Url))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(theme::BORDER_TYPE)
-                    .title("url"),
-            ),
+        Paragraph::new(Line::from(
+            app.new_conn_url.spans(app.new_conn_field == AddField::Url),
+        ))
+        .style(field_style(AddField::Url))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(theme::BORDER_TYPE)
+                .title("url"),
+        ),
         rows[1],
     );
     let kind_label = format!("< {} >", app.new_conn_kind.label());

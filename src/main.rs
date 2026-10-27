@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod datasource;
+mod input;
 mod theme;
 mod ui;
 mod value;
