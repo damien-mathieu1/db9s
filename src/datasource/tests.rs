@@ -3,8 +3,9 @@
 //!
 //! Each backend is skipped unless its URL env var is set, e.g. with the dev stack:
 //!   DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
-//!   DB9S_TEST_MONGO_URL=mongodb://localhost:57017 cargo test
-use super::{mongo::MongoSource, postgres::PostgresSource, DataSource};
+//!   DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
+//!   DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 cargo test
+use super::{mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource, DataSource};
 use serde_json::json;
 
 fn unique(prefix: &str) -> String {
@@ -111,4 +112,90 @@ async fn mongo_conformance() {
     exercise(&source, db, &coll_name, r#"{"name": "z"}"#).await;
 
     coll.drop().await.unwrap();
+}
+
+/// Queues don't fit the row scenario (no per-message edit/delete), so RabbitMQ gets
+/// its own: publish, peek without consuming, paginate, read-only edit, purge.
+#[tokio::test]
+async fn rabbitmq_conformance() {
+    let Ok(url) = std::env::var("DB9S_TEST_RABBITMQ_URL") else {
+        eprintln!("skipped: DB9S_TEST_RABBITMQ_URL not set");
+        return;
+    };
+    // the management API comes up a few seconds after the broker
+    let mut source = RabbitMqSource::connect(&url).await;
+    for _ in 0..15 {
+        if source.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        source = RabbitMqSource::connect(&url).await;
+    }
+    let source = source.unwrap();
+
+    let queue = unique("db9s_test");
+    let mut base = reqwest::Url::parse(&url).unwrap();
+    let auth = (
+        base.username().to_string(),
+        base.password().map(str::to_string),
+    );
+    // credentials go in basic_auth only; leaving them in the URL sends two Authorization headers
+    base.set_username("").unwrap();
+    base.set_password(None).unwrap();
+    let queue_url = base.join(&format!("api/queues/%2F/{queue}")).unwrap();
+    let http = reqwest::Client::new();
+    http.put(queue_url.clone())
+        .basic_auth(&auth.0, auth.1.as_ref())
+        .json(&json!({ "durable": false }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    assert!(source
+        .list_databases()
+        .await
+        .unwrap()
+        .contains(&"/".to_string()));
+    assert!(source.list_containers("/").await.unwrap().contains(&queue));
+
+    for payload in ["hello", "world"] {
+        let res = source.run_query("/", &queue, payload).await.unwrap();
+        assert_eq!(res.affected, Some(1));
+    }
+
+    let res = source.fetch_rows("/", &queue, 10, 0).await.unwrap();
+    assert!(res.columns.iter().any(|c| c == "payload"));
+    let payloads: Vec<_> = res.rows.iter().map(|r| r["payload"].clone()).collect();
+    assert_eq!(payloads, vec![json!("hello"), json!("world")]);
+    // peeking requeues, so the messages are still there
+    assert_eq!(
+        source
+            .fetch_rows("/", &queue, 10, 0)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    let paged = source.fetch_rows("/", &queue, 1, 1).await.unwrap();
+    assert_eq!(paged.rows[0]["payload"], json!("world"));
+
+    let row = &res.rows[0];
+    assert!(source.update_row("/", &queue, row, row).await.is_err());
+
+    source.delete_row("/", &queue, row).await.unwrap();
+    assert!(source
+        .fetch_rows("/", &queue, 10, 0)
+        .await
+        .unwrap()
+        .rows
+        .is_empty());
+
+    http.delete(queue_url)
+        .basic_auth(&auth.0, auth.1.as_ref())
+        .send()
+        .await
+        .unwrap();
 }
