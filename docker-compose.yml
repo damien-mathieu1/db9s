@@ -32,3 +32,15 @@ services:
     volumes:
       - ./dev/seed-rabbitmq.sh:/seed.sh:ro
     entrypoint: ["sh", "/seed.sh"]
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "56379:6379"
+
+  redis-seed:
+    image: redis:7-alpine
+    depends_on: [redis]
+    volumes:
+      - ./dev/seed-redis.sh:/seed.sh:ro
+    entrypoint: ["sh", "/seed.sh"]

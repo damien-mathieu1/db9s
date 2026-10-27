@@ -123,6 +123,7 @@ pub struct App {
 async fn connect(kind: Kind, url: &str) -> Result<Box<dyn DataSource>> {
     use crate::datasource::{
         amqp::AmqpSource, mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
+        redis::RedisSource,
     };
     let fut = async {
         Ok(match kind {
@@ -130,6 +131,7 @@ async fn connect(kind: Kind, url: &str) -> Result<Box<dyn DataSource>> {
             Kind::Mongo => Box::new(MongoSource::connect(url).await?),
             Kind::RabbitMq if url.starts_with("amqp") => Box::new(AmqpSource::connect(url).await?),
             Kind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
+            Kind::Redis => Box::new(RedisSource::connect(url).await?),
         })
     };
     tokio::time::timeout(CONNECT_TIMEOUT, fut)

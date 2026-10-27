@@ -5,10 +5,11 @@
 //!   DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
 //!   DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 //!   DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
-//!   DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F cargo test
+//!   DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
+//!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 use super::{
     amqp::AmqpSource, mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
-    DataSource,
+    redis::RedisSource, DataSource,
 };
 use serde_json::json;
 
@@ -248,4 +249,155 @@ async fn amqp_conformance() {
     )
     .await
     .unwrap();
+}
+
+/// Redis rows depend on the key type, so each type gets its own browse / edit / delete check.
+#[tokio::test]
+async fn redis_conformance() {
+    let Ok(url) = std::env::var("DB9S_TEST_REDIS_URL") else {
+        eprintln!("skipped: DB9S_TEST_REDIS_URL not set");
+        return;
+    };
+    let source = RedisSource::connect(&url).await.unwrap();
+    let p = unique("db9s_test");
+    let k = |t: &str| format!("{p}:{t}");
+    let db = "db0";
+    let run = |cmd: String| {
+        let source = &source;
+        async move { source.run_query(db, "", &cmd).await.unwrap() }
+    };
+    let fetch = |key: String, limit, offset| {
+        let source = &source;
+        async move { source.fetch_rows(db, &key, limit, offset).await.unwrap() }
+    };
+
+    run(format!("SET {} 'hello world'", k("str"))).await;
+    run(format!("HSET {} a 1 b 2", k("hash"))).await;
+    run(format!("RPUSH {} x y z", k("list"))).await;
+    run(format!("SADD {} s1 s2", k("set"))).await;
+    run(format!("ZADD {} 1 m1 2 m2", k("zset"))).await;
+    run(format!("XADD {} * f v1", k("stream"))).await;
+    run(format!("XADD {} * f v2", k("stream"))).await;
+
+    assert!(source
+        .list_databases()
+        .await
+        .unwrap()
+        .contains(&db.to_string()));
+    assert!(source
+        .list_containers(db)
+        .await
+        .unwrap()
+        .contains(&k("str")));
+    assert_eq!(
+        run(format!("GET {}", k("str"))).await.rows[0]["result"],
+        json!("hello world")
+    );
+
+    // string
+    let row = fetch(k("str"), 10, 0).await.rows[0].clone();
+    let mut edited = row.clone();
+    edited.insert("value".into(), json!("bye"));
+    source
+        .update_row(db, &k("str"), &row, &edited)
+        .await
+        .unwrap();
+    assert_eq!(fetch(k("str"), 10, 0).await.rows[0]["value"], json!("bye"));
+
+    // hash: rename a field, delete another
+    let res = fetch(k("hash"), 10, 0).await;
+    assert_eq!(res.columns, vec!["field", "value"]);
+    let a = res.rows[0].clone();
+    let mut edited = a.clone();
+    edited.insert("field".into(), json!("z"));
+    source
+        .update_row(db, &k("hash"), &a, &edited)
+        .await
+        .unwrap();
+    source
+        .delete_row(db, &k("hash"), &res.rows[1])
+        .await
+        .unwrap();
+    let res = fetch(k("hash"), 10, 0).await;
+    assert_eq!(res.rows.len(), 1);
+    assert_eq!(res.rows[0]["field"], json!("z"));
+    assert_eq!(res.rows[0]["value"], json!("1"));
+
+    // list: paging, set by index, delete by index
+    let page = fetch(k("list"), 2, 1).await;
+    assert_eq!(page.rows[0]["index"], json!(1));
+    assert_eq!(page.rows[0]["value"], json!("y"));
+    let mut edited = page.rows[0].clone();
+    edited.insert("value".into(), json!("Y"));
+    source
+        .update_row(db, &k("list"), &page.rows[0], &edited)
+        .await
+        .unwrap();
+    source
+        .delete_row(db, &k("list"), &page.rows[1])
+        .await
+        .unwrap();
+    let values: Vec<_> = fetch(k("list"), 10, 0)
+        .await
+        .rows
+        .iter()
+        .map(|r| r["value"].clone())
+        .collect();
+    assert_eq!(values, vec![json!("x"), json!("Y")]);
+
+    // set
+    let res = fetch(k("set"), 10, 0).await;
+    let mut edited = res.rows[0].clone();
+    edited.insert("member".into(), json!("s9"));
+    source
+        .update_row(db, &k("set"), &res.rows[0], &edited)
+        .await
+        .unwrap();
+    source
+        .delete_row(db, &k("set"), &res.rows[1])
+        .await
+        .unwrap();
+    let res = fetch(k("set"), 10, 0).await;
+    assert_eq!(res.rows.len(), 1);
+    assert_eq!(res.rows[0]["member"], json!("s9"));
+
+    // zset: change a score, delete a member
+    let res = fetch(k("zset"), 10, 0).await;
+    assert_eq!(res.rows[0]["member"], json!("m1"));
+    let mut edited = res.rows[0].clone();
+    edited.insert("score".into(), json!(5));
+    source
+        .update_row(db, &k("zset"), &res.rows[0], &edited)
+        .await
+        .unwrap();
+    source
+        .delete_row(db, &k("zset"), &res.rows[1])
+        .await
+        .unwrap();
+    let res = fetch(k("zset"), 10, 0).await;
+    assert_eq!(res.rows.len(), 1);
+    assert_eq!(res.rows[0]["score"], json!(5.0));
+
+    // stream: read-only entries, deletable
+    let res = fetch(k("stream"), 10, 0).await;
+    assert_eq!(res.rows.len(), 2);
+    assert_eq!(res.rows[0]["fields"], json!({"f": "v1"}));
+    assert!(source
+        .update_row(db, &k("stream"), &res.rows[0], &res.rows[0])
+        .await
+        .is_err());
+    source
+        .delete_row(db, &k("stream"), &res.rows[0])
+        .await
+        .unwrap();
+    assert_eq!(fetch(k("stream"), 10, 0).await.rows.len(), 1);
+
+    // deleting the only row of a string removes the key
+    let row = fetch(k("str"), 10, 0).await.rows[0].clone();
+    source.delete_row(db, &k("str"), &row).await.unwrap();
+    assert!(fetch(k("str"), 10, 0).await.rows.is_empty());
+
+    for t in ["hash", "list", "set", "zset", "stream"] {
+        run(format!("DEL {}", k(t))).await;
+    }
 }

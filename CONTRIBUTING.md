@@ -5,10 +5,10 @@ Issues and PRs are welcome.
 ## Dev setup
 
 ```bash
-docker compose up -d          # local postgres + mongo + rabbitmq, seeded (dev/seed.sql, dev/seed.js, dev/seed-rabbitmq.sh)
+docker compose up -d          # local postgres + mongo + redis + rabbitmq, seeded (dev/seed*)
 docker compose down -v        # wipe data; next `up` re-seeds
 cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017 \
-  --rabbitmq http://db9s:db9s@localhost:55672
+  --redis redis://localhost:56379 --rabbitmq http://db9s:db9s@localhost:55672
 ```
 
 ## Before opening a PR
@@ -19,13 +19,14 @@ cargo clippy --all-targets
 DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
 DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
-DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F cargo test
+DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
+DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 ```
 
 `src/datasource/tests.rs` runs the same scenario (list, page, update, query,
 delete) against every database backend, and `exercise_queue()` runs the broker
 scenario (publish, peek, purge) against every queue backend (RabbitMQ over the
-management API and over AMQP). A backend without
+management API and over AMQP). Redis has its own test, one check per key type. A backend without
 its URL env var is skipped. CI runs them all against real services.
 
 Keep the diff focused on one change. No unused code, no new warnings.

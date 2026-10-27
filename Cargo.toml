@@ -2,11 +2,11 @@
 name = "db9s"
 version = "2026.10.1"
 edition = "2021"
-description = "k9s-style terminal UI to browse, query, and edit Postgres, MongoDB and RabbitMQ"
+description = "k9s-style terminal UI to browse, query, and edit Postgres, MongoDB, Redis and RabbitMQ"
 license = "MIT"
 repository = "https://github.com/damien-mathieu1/db9s"
 readme = "README.md"
-keywords = ["tui", "postgres", "mongodb", "rabbitmq", "database"]
+keywords = ["tui", "postgres", "mongodb", "redis", "rabbitmq"]
 categories = ["command-line-utilities", "database"]
 exclude = ["dev/", "docker-compose.yml", ".github/"]
 
@@ -29,6 +29,7 @@ chrono = "0.4"
 uuid = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 lapin = { version = "4", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
+redis = { version = "1.8", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams"] }
 
 [profile.release]
 lto = true

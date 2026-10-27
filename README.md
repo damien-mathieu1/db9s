@@ -26,9 +26,9 @@ Or grab a prebuilt binary (Linux, macOS, Windows) from the
 | PostgreSQL | 🟢 Supported |
 | MongoDB | 🟢 Supported |
 | RabbitMQ | 🟢 Supported |
+| Redis | 🟢 Supported |
 | MySQL / MariaDB | 🔴 Planned |
 | SQLite | 🔴 Planned |
-| Redis | 🔴 Planned |
 | Microsoft SQL Server | 🔴 Planned |
 | ClickHouse | 🔴 Planned |
 | Cassandra / ScyllaDB | 🔴 Planned |
@@ -41,6 +41,7 @@ Every backend gets the same screens and keys. Want one sooner? See
 ```bash
 db9s --postgres postgres://user:pass@localhost/db
 db9s --mongo mongodb://localhost:27017
+db9s --redis redis://localhost:6379        # rediss:// for TLS
 db9s --rabbitmq http://guest:guest@localhost:15672             # management API
 db9s --rabbitmq 'amqp://guest:guest@localhost:5672/%2F?queues=orders,emails'  # plain AMQP
 ```
@@ -58,6 +59,11 @@ url = "postgres://user:pass@localhost/db"
 name = "local mongo"
 kind = "mongo"
 url = "mongodb://localhost:27017"
+
+[[connections]]
+name = "local redis"
+kind = "redis"
+url = "redis://localhost:6379"
 
 [[connections]]
 name = "local rabbit"
@@ -88,6 +94,23 @@ removes forward, `ctrl+u` clears before the cursor.
 
 ![inline edit](./docs/edit.png)
 
+### Redis
+
+Databases are the logical DBs (`db0` plus every non-empty one), containers are
+**keys** (first 1000 from `SCAN`), and rows follow the key type:
+
+| Type | Rows | Edit (`e`) | Delete (`d`) |
+|---|---|---|---|
+| string | `value` | `SET` (keeps the TTL) | deletes the key |
+| hash | `field`, `value` | change value or rename field | `HDEL` |
+| list | `index`, `value` | `LSET` | removes that index |
+| set | `member` | rename member | `SREM` |
+| zset | `member`, `score` | change score or member | `ZREM` |
+| stream | `id`, `fields` | read-only | `XDEL` |
+
+`/` runs any Redis command (`HGETALL user:1`, `SET greeting "hi there"`) and
+shows the raw reply, like `redis-cli`.
+
 ### RabbitMQ
 
 Same screens: databases are **vhosts**, containers are **queues**, rows are
@@ -112,7 +135,7 @@ Same screens: databases are **vhosts**, containers are **queues**, rows are
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md): local Postgres, Mongo and RabbitMQ with seed data,
+See [CONTRIBUTING.md](CONTRIBUTING.md): local Postgres, Mongo, Redis and RabbitMQ with seed data,
 conformance tests for every backend, and how releases work.
 
 ## License
