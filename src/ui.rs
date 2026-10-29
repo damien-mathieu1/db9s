@@ -9,22 +9,28 @@ use ratatui::{
 };
 
 pub fn draw(f: &mut Frame, app: &App) {
+    let prompt = matches!(app.mode, Mode::Command);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(if prompt { 3 } else { 0 }),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
-    match app.screen {
-        Screen::Connections => draw_connections(f, chunks[1], app),
-        Screen::Databases => draw_list(f, chunks[1], "databases", &app.databases, app.db_idx, true),
-        Screen::Browse => draw_browse(f, chunks[1], app),
+    if prompt {
+        draw_command_prompt(f, chunks[1], app);
     }
-    draw_footer(f, app, chunks[2]);
+    let body = chunks[2];
+    match app.screen {
+        Screen::Connections => draw_connections(f, body, app),
+        Screen::Databases => draw_list(f, body, "databases", &app.databases, app.db_idx, true),
+        Screen::Browse => draw_browse(f, body, app),
+    }
+    draw_footer(f, app, chunks[3]);
 
     if matches!(app.mode, Mode::ConfirmEditSave) {
         draw_confirm_edit_popup(f, app);
@@ -82,6 +88,44 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(theme::BORDER_BLUR)),
     );
     f.render_widget(title, area);
+}
+
+/// k9s-style command bar: `> typed` followed by the greyed rest of the suggestion.
+fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(
+        "> ",
+        Style::default()
+            .fg(theme::BORDER_FOCUS)
+            .add_modifier(Modifier::BOLD),
+    )];
+    match app.command_suggestion().filter(|s| !s.is_empty()) {
+        Some(rest) => {
+            let mut chars = rest.chars();
+            let first = chars.next().unwrap_or(' ').to_string();
+            spans.push(Span::raw(app.command_input.value().to_string()));
+            spans.push(Span::styled(
+                first,
+                Style::default()
+                    .fg(theme::HELP_TEXT)
+                    .add_modifier(Modifier::REVERSED),
+            ));
+            spans.push(Span::styled(
+                chars.as_str().to_string(),
+                Style::default().fg(theme::HELP_TEXT),
+            ));
+        }
+        None => spans.extend(app.command_input.spans(true)),
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(theme::BORDER_TYPE)
+                .border_style(pane_border(true))
+                .title("command"),
+        ),
+        area,
+    );
 }
 
 fn conn_name(app: &App) -> String {
@@ -367,10 +411,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         } else {
             theme::HELP_TEXT
         };
-        line.spans.push(Span::styled(
-            format!("  │ {}", app.status),
-            Style::default().fg(color),
-        ));
+        let status = Span::styled(app.status.clone(), Style::default().fg(color));
+        // errors go first so a long key list never truncates them
+        if is_err {
+            line.spans.insert(0, Span::raw("  │ "));
+            line.spans.insert(0, status);
+        } else {
+            line.spans.push(Span::raw("  │ "));
+            line.spans.push(status);
+        }
     }
     f.render_widget(Paragraph::new(line), area);
 }

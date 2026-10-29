@@ -34,6 +34,8 @@ pub enum Mode {
     AddConnection,
     ConfirmDeleteConn,
     Settings,
+    /// k9s-style `:` prompt to jump to a connection, database or container by name.
+    Command,
 }
 
 /// Inline, field-by-field edit of one row/document, saved in one update.
@@ -68,6 +70,25 @@ pub struct ConnEntry {
 
 /// Masks the password portion of a connection string, e.g.
 /// `postgres://user:secret@host/db` -> `postgres://user:***@host/db`.
+const COMMANDS: [&str; 6] = ["connections", "ctx", "settings", "add", "quit", "q"];
+
+/// Candidates that extend `typed` (case-insensitive), shortest first, for fish-style
+/// completion. Nothing is suggested before the first character is typed.
+pub fn complete(candidates: &[String], typed: &str) -> Vec<String> {
+    if typed.is_empty() {
+        return vec![];
+    }
+    let t = typed.to_lowercase();
+    let mut out: Vec<String> = candidates
+        .iter()
+        .filter(|c| c.to_lowercase().starts_with(&t) && c.chars().count() > typed.chars().count())
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+    out.dedup();
+    out
+}
+
 pub fn mask_password(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -110,6 +131,9 @@ pub struct App {
     pub editor_cmd: String,
     pub settings_editor_input: Input,
     pub settings_error: Option<String>,
+    pub command_input: Input,
+    /// Which matching suggestion is shown, cycled with up/down.
+    pub command_idx: usize,
 
     pub new_conn_name: Input,
     pub new_conn_url: Input,
@@ -208,6 +232,8 @@ impl App {
             editor_cmd: editor_cmd.clone(),
             settings_editor_input: Input::new(editor_cmd),
             settings_error: None,
+            command_input: Input::default(),
+            command_idx: 0,
             new_conn_name: Input::default(),
             new_conn_url: Input::default(),
             new_conn_kind: Kind::Postgres,
@@ -317,6 +343,7 @@ impl App {
             Mode::AddConnection => self.handle_add_conn_key(key).await,
             Mode::ConfirmDeleteConn => self.handle_confirm_delete_conn_key(key).await,
             Mode::Settings => self.handle_settings_key(key),
+            Mode::Command => self.handle_command_key(key).await,
         }
     }
 
@@ -366,6 +393,11 @@ impl App {
             KeyCode::Char('d') if self.rows_focused() && self.selected_row().is_some() => {
                 self.mode = Mode::ConfirmDelete;
             }
+            KeyCode::Char(':') => {
+                self.command_input = Input::default();
+                self.command_idx = 0;
+                self.mode = Mode::Command;
+            }
             KeyCode::Char('s') if self.screen == Screen::Connections => self.start_settings(),
             KeyCode::Char('a') if self.screen == Screen::Connections => self.start_add_conn(),
             KeyCode::Char('e') if self.screen == Screen::Connections => self.start_edit_conn(),
@@ -378,6 +410,9 @@ impl App {
 
     /// Key hints for the footer, same for every backend since all go through `DataSource`.
     pub fn key_hints(&self) -> &'static str {
+        if matches!(self.mode, Mode::Command) {
+            return "enter run  tab/→ complete  ↑/↓ suggestions  esc cancel";
+        }
         if let Some(fe) = &self.field_edit {
             return if fe.input.is_some() {
                 "←/→ move  enter apply  esc cancel  42/true/null/{..} keep_type  \"..\" forces_text"
@@ -386,10 +421,10 @@ impl App {
             };
         }
         match self.screen {
-            Screen::Connections => "j/k move  enter open  a add  e edit  d delete  s settings  q quit",
-            Screen::Databases => "j/k move  enter open  esc back",
+            Screen::Connections => "j/k move  enter open  a add  e edit  d delete  s settings  : command  q quit",
+            Screen::Databases => "j/k move  enter open  : command  esc back",
             Screen::Browse => match self.browse_focus {
-                BrowseFocus::Containers => "j/k move+preview  enter/tab rows  esc back",
+                BrowseFocus::Containers => "j/k move+preview  enter/tab rows  : command  esc back",
                 BrowseFocus::Rows if self.is_queue() => {
                     "j/k move  / publish  d purge queue  n/p page  r refresh  tab queues  esc back"
                 }
@@ -397,6 +432,98 @@ impl App {
                     "j/k move  e edit  E $EDITOR  d delete  / query  n/p page  r refresh  tab containers  esc back"
                 }
             },
+        }
+    }
+
+    /// Everything `:` can jump to from here: built-ins, connections, and the
+    /// databases / containers already listed for the current connection.
+    fn command_candidates(&self) -> Vec<String> {
+        let mut out: Vec<String> = COMMANDS.iter().map(|c| c.to_string()).collect();
+        out.extend(self.conns.iter().map(|c| c.name.clone()));
+        if self.screen != Screen::Connections {
+            out.extend(self.databases.iter().cloned());
+        }
+        if self.screen == Screen::Browse {
+            out.extend(self.containers.iter().cloned());
+        }
+        out
+    }
+
+    /// The full candidate currently suggested for what's typed, if any.
+    fn command_choice(&self) -> Option<String> {
+        let matches = complete(&self.command_candidates(), self.command_input.value());
+        (!matches.is_empty()).then(|| matches[self.command_idx % matches.len()].clone())
+    }
+
+    /// The not-yet-typed rest of the suggestion, shown greyed after the input.
+    pub fn command_suggestion(&self) -> Option<String> {
+        let typed = self.command_input.value().chars().count();
+        self.command_choice()
+            .map(|full| full.chars().skip(typed).collect())
+    }
+
+    async fn handle_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                let cmd = self.command_input.value().trim().to_string();
+                self.mode = Mode::Normal;
+                self.run_command(&cmd).await;
+            }
+            KeyCode::Tab | KeyCode::Right if self.command_choice().is_some() => {
+                self.command_input = Input::new(self.command_choice().unwrap());
+                self.command_idx = 0;
+            }
+            KeyCode::Up => self.command_idx += 1,
+            KeyCode::Down => self.command_idx = self.command_idx.saturating_sub(1),
+            _ => {
+                self.command_input.handle(key);
+                self.command_idx = 0;
+            }
+        }
+    }
+
+    async fn run_command(&mut self, cmd: &str) {
+        let find = |names: &[String]| names.iter().position(|n| n.eq_ignore_ascii_case(cmd));
+        match cmd.to_lowercase().as_str() {
+            "" => {}
+            "q" | "q!" | "quit" => self.should_quit = true,
+            "connections" | "conn" | "ctx" => {
+                self.screen = Screen::Connections;
+                self.browse_focus = BrowseFocus::Containers;
+            }
+            "settings" => self.start_settings(),
+            "add" => self.start_add_conn(),
+            _ => {
+                if let Some(i) = (self.screen == Screen::Browse)
+                    .then(|| find(&self.containers))
+                    .flatten()
+                {
+                    self.container_idx = i;
+                    self.browse_focus = BrowseFocus::Containers;
+                    self.preview_container().await;
+                    if self.result.is_some() {
+                        self.browse_focus = BrowseFocus::Rows;
+                    }
+                } else if let Some(i) = (self.screen != Screen::Connections)
+                    .then(|| find(&self.databases))
+                    .flatten()
+                {
+                    self.db_idx = i;
+                    self.screen = Screen::Databases;
+                    self.enter().await;
+                } else if let Some(i) = self
+                    .conns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(cmd))
+                {
+                    self.conn_idx = i;
+                    self.screen = Screen::Connections;
+                    self.enter().await;
+                } else {
+                    self.status = format!("error: unknown command '{cmd}'");
+                }
+            }
         }
     }
 
@@ -934,7 +1061,20 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_password;
+    use super::{complete, mask_password};
+
+    #[test]
+    fn completes_fish_style() {
+        let c: Vec<String> = ["users", "user_roles", "orders", "Users", "u"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(complete(&c, "us"), vec!["Users", "users", "user_roles"]);
+        assert_eq!(complete(&c, "user_"), vec!["user_roles"]);
+        assert!(complete(&c, "users").is_empty());
+        assert!(complete(&c, "").is_empty());
+        assert!(complete(&c, "zzz").is_empty());
+    }
 
     #[test]
     fn masks_postgres_password() {
