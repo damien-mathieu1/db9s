@@ -10,6 +10,18 @@ services:
     volumes:
       - ./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
 
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: db9s
+      MYSQL_DATABASE: db9s
+      MYSQL_USER: db9s
+      MYSQL_PASSWORD: db9s
+    ports:
+      - "53306:3306"
+    volumes:
+      - ./dev/seed-mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+
   mongo:
     image: mongo:7
     ports:

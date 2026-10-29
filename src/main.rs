@@ -20,7 +20,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "db9s",
-    about = "k9s-style TUI browser for Postgres, MongoDB, RabbitMQ and Redis"
+    about = "k9s-style TUI browser for Postgres, MySQL, MongoDB, Redis and RabbitMQ"
 )]
 struct Args {
     /// One-off postgres connection url, added as a connection named "postgres"
@@ -36,6 +36,9 @@ struct Args {
     /// One-off Redis url (redis:// or rediss://), added as a connection named "redis"
     #[arg(long)]
     redis: Option<String>,
+    /// One-off MySQL / MariaDB url, added as a connection named "mysql"
+    #[arg(long)]
+    mysql: Option<String>,
 }
 
 #[tokio::main]
@@ -68,6 +71,13 @@ async fn main() -> Result<()> {
         cfg.connections.push(config::Connection {
             name: "redis".into(),
             kind: config::Kind::Redis,
+            url,
+        });
+    }
+    if let Some(url) = args.mysql {
+        cfg.connections.push(config::Connection {
+            name: "mysql".into(),
+            kind: config::Kind::MySql,
             url,
         });
     }

@@ -12,10 +12,17 @@ pub enum Kind {
     /// `http(s)://` = management API, `amqp(s)://` = plain AMQP.
     RabbitMq,
     Redis,
+    MySql,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Postgres, Kind::Mongo, Kind::RabbitMq, Kind::Redis];
+    pub const ALL: [Kind; 5] = [
+        Kind::Postgres,
+        Kind::MySql,
+        Kind::Mongo,
+        Kind::RabbitMq,
+        Kind::Redis,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
@@ -23,6 +30,7 @@ impl Kind {
             Kind::Mongo => "mongo",
             Kind::RabbitMq => "rabbitmq",
             Kind::Redis => "redis",
+            Kind::MySql => "mysql",
         }
     }
 

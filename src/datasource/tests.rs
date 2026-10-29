@@ -3,13 +3,14 @@
 //!
 //! Each backend is skipped unless its URL env var is set, e.g. with the dev stack:
 //!   DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
+//!   DB9S_TEST_MYSQL_URL=mysql://db9s:db9s@localhost:53306/db9s \
 //!   DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 //!   DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
 //!   DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
 //!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 use super::{
-    amqp::AmqpSource, mongo::MongoSource, postgres::PostgresSource, rabbitmq::RabbitMqSource,
-    redis::RedisSource, DataSource,
+    amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
+    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource,
 };
 use serde_json::json;
 
@@ -85,8 +86,46 @@ async fn postgres_conformance() {
     .unwrap();
 
     let source = PostgresSource::connect(&url).await.unwrap();
-    let query = format!("SELECT * FROM public.{table} WHERE name = 'z'");
+    let query = format!("SELECT * FROM {table} WHERE name = 'z'");
     exercise(&source, "public", &table, &query).await;
+
+    // composite primary key: the engine must match on both columns
+    let pair = unique("db9s_test_pair");
+    sqlx::query(&format!(
+        "CREATE TABLE public.{pair} (a int, b int, v text, PRIMARY KEY (a, b))"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO public.{pair} VALUES (1, 1, 'x'), (1, 2, 'y')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rows = source
+        .fetch_rows("public", &pair, 10, 0)
+        .await
+        .unwrap()
+        .rows;
+    let row = rows.iter().find(|r| r["b"] == json!(2)).unwrap();
+    let mut edited = row.clone();
+    edited.insert("v".into(), json!("z"));
+    source
+        .update_row("public", &pair, row, &edited)
+        .await
+        .unwrap();
+    let rows = source
+        .fetch_rows("public", &pair, 10, 0)
+        .await
+        .unwrap()
+        .rows;
+    let vs: Vec<_> = rows.iter().map(|r| r["v"].clone()).collect();
+    assert!(vs.contains(&json!("x")) && vs.contains(&json!("z")));
+    sqlx::query(&format!("DROP TABLE public.{pair}"))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     sqlx::query(&format!("DROP TABLE public.{table}"))
         .execute(&pool)
@@ -400,4 +439,33 @@ async fn redis_conformance() {
     for t in ["hash", "list", "set", "zset", "stream"] {
         run(format!("DEL {}", k(t))).await;
     }
+}
+
+#[tokio::test]
+async fn mysql_conformance() {
+    let Ok(url) = std::env::var("DB9S_TEST_MYSQL_URL") else {
+        eprintln!("skipped: DB9S_TEST_MYSQL_URL not set");
+        return;
+    };
+    let table = unique("db9s_test");
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    sqlx::query(&format!(
+        "CREATE TABLE {table} (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50) NOT NULL)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!("INSERT INTO {table} (name) VALUES ('a'), ('b')"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let source = MySqlSource::connect(&url).await.unwrap();
+    let query = format!("SELECT * FROM {table} WHERE name = 'z'");
+    exercise(&source, "db9s", &table, &query).await;
+
+    sqlx::query(&format!("DROP TABLE {table}"))
+        .execute(&pool)
+        .await
+        .unwrap();
 }
