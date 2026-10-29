@@ -77,6 +77,7 @@ editor = "nvim"  # optional, for `E` — defaults to $EDITOR, then vi
 
 | Key | Action |
 |---|---|
+| `:` | command bar (k9s-style): jump to a connection, database or table/collection/key/queue by name, `tab`/`→` completes, `↑`/`↓` cycle suggestions. Also `:connections` (`:ctx`), `:settings`, `:add`, `:q` |
 | `j`/`k` / arrows | move (highlighting a table/collection previews its rows) |
 | `enter` / `tab` | open, switch between containers and rows pane |
 | `esc` / `q` | back a level (`q` quits from connections) |
