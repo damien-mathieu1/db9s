@@ -2,7 +2,7 @@
 name = "db9s"
 version = "2026.10.2"
 edition = "2021"
-description = "k9s-style terminal UI to browse, query, and edit Postgres, MongoDB, Redis and RabbitMQ"
+description = "k9s-style terminal UI to browse, query, and edit Postgres, MySQL, MongoDB, Redis and RabbitMQ"
 license = "MIT"
 repository = "https://github.com/damien-mathieu1/db9s"
 readme = "README.md"
@@ -14,7 +14,7 @@ exclude = ["dev/", "docker-compose.yml", ".github/"]
 ratatui = "0.29"
 crossterm = "0.28"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "uuid", "json", "rust_decimal"] }
 mongodb = { version = "3", features = ["rustls-tls"] }
 bson = { version = "2", features = ["serde_with-3", "chrono-0_4"] }
 serde = { version = "1", features = ["derive"] }

@@ -61,10 +61,11 @@ fn decode_pg_value(row: &sqlx::postgres::PgRow, col: &sqlx::postgres::PgColumn) 
         "float4" => try_as!(f32),
         "float8" => try_as!(f64),
         "bool" => try_as!(bool),
+        // as a string so values like 49.90 keep their exact precision
         "numeric" => row
-            .try_get::<f64, _>(idx)
+            .try_get::<sqlx::types::Decimal, _>(idx)
             .ok()
-            .and_then(|v| serde_json::to_value(v).ok()),
+            .map(|v| Value::String(v.to_string())),
         "json" | "jsonb" => try_as!(serde_json::Value),
         "uuid" => try_as!(uuid::Uuid),
         "timestamp" => row
@@ -85,6 +86,73 @@ fn decode_pg_value(row: &sqlx::postgres::PgRow, col: &sqlx::postgres::PgColumn) 
     };
 
     result.unwrap_or(Value::Null)
+}
+
+pub fn mysql_row_to_json(row: &sqlx::mysql::MySqlRow) -> Row {
+    use sqlx::{Column, Row as _, TypeInfo, ValueRef};
+    let mut map = Map::new();
+    for col in row.columns() {
+        let idx = col.ordinal();
+        let is_null = row.try_get_raw(idx).map_or(true, |v| v.is_null());
+        let type_name = col.type_info().name().to_uppercase();
+
+        macro_rules! try_as {
+            ($t:ty) => {
+                row.try_get::<$t, _>(idx)
+                    .ok()
+                    .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+            };
+        }
+        let text = |v: Option<String>| v.map(Value::String);
+
+        let val = if is_null {
+            Some(Value::Null)
+        } else if type_name.ends_with("UNSIGNED") {
+            try_as!(u64)
+        } else {
+            match type_name.as_str() {
+                "BOOLEAN" => try_as!(bool),
+                "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" => try_as!(i64),
+                "FLOAT" => try_as!(f32),
+                "DOUBLE" => try_as!(f64),
+                "DECIMAL" => text(
+                    row.try_get::<sqlx::types::Decimal, _>(idx)
+                        .ok()
+                        .map(|v| v.to_string()),
+                ),
+                "JSON" => try_as!(serde_json::Value),
+                "DATE" => text(
+                    row.try_get::<chrono::NaiveDate, _>(idx)
+                        .ok()
+                        .map(|v| v.to_string()),
+                ),
+                "TIME" => text(
+                    row.try_get::<chrono::NaiveTime, _>(idx)
+                        .ok()
+                        .map(|v| v.to_string()),
+                ),
+                "DATETIME" => text(
+                    row.try_get::<chrono::NaiveDateTime, _>(idx)
+                        .ok()
+                        .map(|v| v.to_string()),
+                ),
+                "TIMESTAMP" => text(
+                    row.try_get::<chrono::DateTime<chrono::Utc>, _>(idx)
+                        .ok()
+                        .map(|v| v.to_rfc3339()),
+                ),
+                _ => try_as!(String),
+            }
+        };
+        // binary or unknown types: show the bytes as (lossy) text rather than null
+        let val = val.unwrap_or_else(|| {
+            row.try_get::<Vec<u8>, _>(idx)
+                .map(|b| Value::String(String::from_utf8_lossy(&b).into_owned()))
+                .unwrap_or(Value::Null)
+        });
+        map.insert(col.name().to_string(), val);
+    }
+    map
 }
 
 /// Text shown in the inline field editor: strings unquoted, everything else as JSON.
