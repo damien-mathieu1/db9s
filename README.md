@@ -24,10 +24,10 @@ Or grab a prebuilt binary (Linux, macOS, Windows) from the
 | Database | Status |
 |---|---|
 | PostgreSQL | 🟢 Supported |
+| MySQL / MariaDB | 🟢 Supported |
 | MongoDB | 🟢 Supported |
 | RabbitMQ | 🟢 Supported |
 | Redis | 🟢 Supported |
-| MySQL / MariaDB | 🔴 Planned |
 | SQLite | 🔴 Planned |
 | Microsoft SQL Server | 🔴 Planned |
 | ClickHouse | 🔴 Planned |
@@ -40,6 +40,7 @@ Every backend gets the same screens and keys. Want one sooner? See
 
 ```bash
 db9s --postgres postgres://user:pass@localhost/db
+db9s --mysql mysql://user:pass@localhost:3306/db
 db9s --mongo mongodb://localhost:27017
 db9s --redis redis://localhost:6379        # rediss:// for TLS
 db9s --rabbitmq http://guest:guest@localhost:15672             # management API
@@ -54,6 +55,11 @@ Or just run `db9s` and add connections from the TUI (`a`). They are saved to
 name = "local pg"
 kind = "postgres"
 url = "postgres://user:pass@localhost/db"
+
+[[connections]]
+name = "local mysql"
+kind = "mysql"
+url = "mysql://user:pass@localhost:3306/db"
 
 [[connections]]
 name = "local mongo"
@@ -130,7 +136,7 @@ Same screens: databases are **vhosts**, containers are **queues**, rows are
 
 ## Notes
 
-- Row edit/delete on Postgres needs a primary key column named `id`.
+- SQL row edit/delete uses the table's primary key (composite keys work); tables without one are read-only.
 - Color palette ported from [mongotui](https://github.com/kreulenk/mongotui).
 
 ## Contributing

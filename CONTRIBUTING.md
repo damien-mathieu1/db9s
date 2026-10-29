@@ -5,9 +5,10 @@ Issues and PRs are welcome.
 ## Dev setup
 
 ```bash
-docker compose up -d          # local postgres + mongo + redis + rabbitmq, seeded (dev/seed*)
+docker compose up -d          # local postgres + mysql + mongo + redis + rabbitmq, seeded (dev/seed*)
 docker compose down -v        # wipe data; next `up` re-seeds
-cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongodb://localhost:57017 \
+cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mysql mysql://db9s:db9s@localhost:53306/db9s \
+  --mongo mongodb://localhost:57017 \
   --redis redis://localhost:56379 --rabbitmq http://db9s:db9s@localhost:55672
 ```
 
@@ -17,6 +18,7 @@ cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mongo mongod
 cargo fmt
 cargo clippy --all-targets
 DB9S_TEST_POSTGRES_URL=postgres://db9s:db9s@localhost:55432/db9s \
+DB9S_TEST_MYSQL_URL=mysql://db9s:db9s@localhost:53306/db9s \
 DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
 DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
@@ -33,8 +35,11 @@ Keep the diff focused on one change. No unused code, no new warnings.
 
 ## Adding a backend
 
-1. Implement the `DataSource` trait (`src/datasource/mod.rs`) in a new module
-   under `src/datasource/`. Message brokers (Kafka, NATS, ...) return `true`
+1. SQL databases: implement `SqlDialect` (`src/datasource/sql.rs`), see
+   `postgres.rs` / `mysql.rs`. The generic `SqlSource` engine does listing,
+   paging, raw queries and primary-key edit/delete. Anything else: implement
+   the `DataSource` trait (`src/datasource/mod.rs`) in a new module under
+   `src/datasource/`. Message brokers (Kafka, NATS, ...) return `true`
    from `is_queue()`: the UI then shows publish/purge and disables edit.
 2. Add a variant to `Kind` in `src/config.rs` (and to `Kind::ALL` / `label()`),
    then an arm in `connect()` in `src/app.rs`. The add-connection form, config
