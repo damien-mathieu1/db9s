@@ -1,6 +1,6 @@
 [package]
 name = "db9s"
-version = "2026.10.2"
+version = "2026.10.3"
 edition = "2021"
 description = "k9s-style terminal UI to browse, query, and edit Postgres, MySQL, MongoDB, Redis and RabbitMQ"
 license = "MIT"
