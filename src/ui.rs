@@ -4,11 +4,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let prompt = matches!(app.mode, Mode::Command);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -27,7 +27,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     let body = chunks[2];
     match app.screen {
         Screen::Connections => draw_connections(f, body, app),
-        Screen::Databases => draw_list(f, body, "databases", &app.databases, app.db_idx, true),
+        Screen::Databases => draw_list(
+            f,
+            body,
+            "databases",
+            &app.databases,
+            app.db_idx,
+            &mut app.db_list,
+            true,
+        ),
         Screen::Browse => draw_browse(f, body, app),
     }
     draw_footer(f, app, chunks[3]);
@@ -149,7 +157,7 @@ fn pane_border(focused: bool) -> Style {
     })
 }
 
-fn draw_connections(f: &mut Frame, area: Rect, app: &App) {
+fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .conns
         .iter()
@@ -187,7 +195,9 @@ fn draw_connections(f: &mut Frame, area: Rect, app: &App) {
             .border_style(pane_border(true))
             .title("connections  (a add, e edit, d delete, s settings)"),
     );
-    f.render_widget(list, area);
+    app.conn_list
+        .select((!app.conns.is_empty()).then_some(app.conn_idx));
+    f.render_stateful_widget(list, area, &mut app.conn_list);
 }
 
 fn draw_list(
@@ -196,6 +206,7 @@ fn draw_list(
     title: &str,
     items: &[String],
     selected: usize,
+    state: &mut ListState,
     focused: bool,
 ) {
     let list_items: Vec<ListItem> = items
@@ -217,10 +228,11 @@ fn draw_list(
             .border_style(pane_border(focused))
             .title(title),
     );
-    f.render_widget(list, area);
+    state.select((!items.is_empty()).then_some(selected));
+    f.render_stateful_widget(list, area, state);
 }
 
-fn draw_browse(f: &mut Frame, area: Rect, app: &App) {
+fn draw_browse(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
@@ -233,16 +245,17 @@ fn draw_browse(f: &mut Frame, area: Rect, app: &App) {
         "containers  (enter open)",
         &app.containers,
         app.container_idx,
+        &mut app.container_list,
         containers_focused,
     );
     match &app.field_edit {
-        Some(fe) => draw_field_editor(f, cols[1], fe),
+        Some(fe) => draw_field_editor(f, cols[1], fe, &mut app.field_list),
         None => draw_rows_pane(f, cols[1], app, !containers_focused),
     }
 }
 
 /// Inline row editor: one `field: value` line per field, changed fields marked with `●`.
-fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit) {
+fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, state: &mut ListState) {
     let items: Vec<ListItem> = fe
         .edited
         .iter()
@@ -280,7 +293,8 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit) {
             .border_style(pane_border(true))
             .title("edit row"),
     );
-    f.render_widget(list, area);
+    state.select((!fe.edited.is_empty()).then_some(fe.idx));
+    f.render_stateful_widget(list, area, state);
 }
 
 /// Each row/document renders as its own card, mongotui-style: up to 4
