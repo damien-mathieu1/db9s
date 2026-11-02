@@ -79,6 +79,25 @@ url = "http://guest:guest@localhost:15672"
 editor = "nvim"  # optional, for `E` — defaults to $EDITOR, then vi
 ```
 
+### Keeping passwords out of the config
+
+A connection `url` (in `config.toml` or in the add-connection form) doesn't have
+to contain the password:
+
+```toml
+# environment variables, resolved when connecting
+url = "postgres://app:${PG_PASSWORD}@db.internal:5432/app"
+
+# or the output of any command: 1Password, pass, Vault, the macOS Keychain...
+url = "cmd: op read op://infra/prod-db/url"
+url = "cmd: security find-generic-password -s prod-db -w"
+```
+
+Only the template is saved and shown; a missing variable or a failing command
+shows an error on that connection. Commands run with no stdin, so use tools whose
+prompt is a GUI (1Password, Touch ID, a graphical pinentry) rather than one that
+asks in the terminal.
+
 ## Usage
 
 | Key | Action |
