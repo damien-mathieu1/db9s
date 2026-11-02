@@ -676,7 +676,8 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
     } else {
         f.render_widget(
             Paragraph::new("tip: ${PG_PASSWORD} or \"cmd: op read op://...\" keeps passwords out of config.toml")
-                .style(Style::default().fg(theme::HELP_TEXT)),
+                // DIM rather than a theme color: renders right under every theme
+                .style(Style::default().add_modifier(Modifier::DIM)),
             rows[4],
         );
     }
