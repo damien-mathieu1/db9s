@@ -151,6 +151,8 @@ pub struct App {
 }
 
 async fn connect(kind: Kind, url: &str) -> Result<Box<dyn DataSource>> {
+    // outside the timeout: a secret manager may wait on a Touch ID / GUI prompt
+    let url = &crate::secrets::resolve(url).await?;
     use crate::datasource::{
         amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
         rabbitmq::RabbitMqSource, redis::RedisSource,
