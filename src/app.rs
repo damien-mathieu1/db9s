@@ -4,6 +4,7 @@ use crate::input::Input;
 use crate::value::Row;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::widgets::ListState;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -112,6 +113,11 @@ pub struct App {
     pub container_idx: usize,
     pub row_idx: usize,
 
+    pub conn_list: ListState,
+    pub db_list: ListState,
+    pub container_list: ListState,
+    pub field_list: ListState,
+
     pub screen: Screen,
     pub browse_focus: BrowseFocus,
     pub mode: Mode,
@@ -216,6 +222,10 @@ impl App {
             db_idx: 0,
             container_idx: 0,
             row_idx: 0,
+            conn_list: ListState::default(),
+            db_list: ListState::default(),
+            container_list: ListState::default(),
+            field_list: ListState::default(),
             screen: Screen::Connections,
             browse_focus: BrowseFocus::Containers,
             mode,
