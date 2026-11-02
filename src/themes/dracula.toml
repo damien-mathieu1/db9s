@@ -1,0 +1,13 @@
+border_type = "thick"
+
+[colors]
+border_focus = "#bd93f9"
+border_blur = "#44475a"
+selected_fg = "#282a36"
+selected_bg = "#bd93f9"
+field_name = "#50fa7b"
+modal_border = "#ff79c6"
+error = "#ff5555"
+success = "#50fa7b"
+key_hint = "#f1fa8c"
+muted = "#6272a4"

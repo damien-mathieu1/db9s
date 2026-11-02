@@ -1,0 +1,14 @@
+# db9s default theme: mongotui-like palette, ANSI 256 indexed colors.
+border_type = "thick"
+
+[colors]
+border_focus = "67"
+border_blur = "240"
+selected_fg = "229"
+selected_bg = "67"
+field_name = "71"
+modal_border = "6"
+error = "9"
+success = "10"
+key_hint = "229"
+muted = "240"

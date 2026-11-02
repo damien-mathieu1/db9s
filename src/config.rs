@@ -54,6 +54,9 @@ pub struct Config {
     /// Command used for `e` (row/document edit). Falls back to $EDITOR, then vi.
     #[serde(default)]
     pub editor: Option<String>,
+    /// Built-in theme or `<config dir>/themes/<name>.toml`. Defaults to "default".
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -94,6 +97,12 @@ pub fn add_connection(conn: Connection) -> Result<()> {
 pub fn remove_connection(name: &str) -> Result<()> {
     let mut cfg = load().unwrap_or_default();
     cfg.connections.retain(|c| c.name != name);
+    save(&cfg)
+}
+
+pub fn set_theme(theme: &str) -> Result<()> {
+    let mut cfg = load().unwrap_or_default();
+    cfg.theme = Some(theme.to_string());
     save(&cfg)
 }
 
