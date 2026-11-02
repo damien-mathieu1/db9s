@@ -135,6 +135,42 @@ Same screens: databases are **vhosts**, containers are **queues**, rows are
 
 ![rabbitmq](./docs/rabbitmq.png)
 
+## Themes
+
+Pick one in settings (`s`, then `tab` and `←`/`→` for a live preview) or with
+`:theme <name>`; the choice is saved to `config.toml` (`theme = "nord"`).
+
+| | |
+|---|---|
+| `default` ![default](./docs/themes/default.png) | `catppuccin-mocha` ![catppuccin-mocha](./docs/themes/catppuccin-mocha.png) |
+| `dracula` ![dracula](./docs/themes/dracula.png) | `gruvbox` ![gruvbox](./docs/themes/gruvbox.png) |
+| `nord` ![nord](./docs/themes/nord.png) | `tokyo-night` ![tokyo-night](./docs/themes/tokyo-night.png) |
+
+Make your own in `~/.config/db9s/themes/<name>.toml` (Linux) /
+`~/Library/Application Support/db9s/themes/<name>.toml` (macOS). Start from a
+built-in and only override what you change; a file named like a built-in
+replaces it. `:theme <name>` re-reads the file, so edit and reload as you go.
+
+```toml
+inherits = "nord"          # optional, defaults to "default"
+border_type = "rounded"    # plain | rounded | double | thick
+
+[colors]                   # "#rrggbb", an ANSI index like "67", or a name like "red"
+border_focus = "#ff5f87"   # focused pane border, header title
+border_blur  = "#4c566a"   # unfocused borders
+selected_fg  = "#2e3440"   # selected row / field text
+selected_bg  = "#88c0d0"   # selected row / field background
+field_name   = "#a3be8c"   # field names in rows and editors
+modal_border = "#b48ead"   # popups
+error        = "#bf616a"
+success      = "#a3be8c"
+key_hint     = "#ebcb8b"   # keys in the footer
+muted        = "#616e88"   # descriptions, urls, hints
+```
+
+The built-ins are in [`src/themes/`](src/themes) if you want a full example.
+A typo in a key or an invalid color shows an error and keeps the current theme.
+
 ## Notes
 
 - SQL row edit/delete uses the table's primary key (composite keys work); tables without one are read-only.

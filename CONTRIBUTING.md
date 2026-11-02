@@ -63,10 +63,14 @@ go to **Actions → Create Release → Run workflow** on `main`. It:
 
 ## Screenshots
 
-`docs/demo.gif` (README hero) and `docs/*.png` are generated with
-[vhs](https://github.com/charmbracelet/vhs) from `docs/demo.tape` and
-`docs/screenshots.tape`, against the seeded `docker compose` stack:
+`docs/demo.gif` (README hero), `docs/*.png` and the theme gallery
+`docs/themes/*.png` are generated with [vhs](https://github.com/charmbracelet/vhs)
+from `docs/demo.tape`, `docs/screenshots.tape` and `docs/themes.tape`, against
+the seeded `docker compose` stack:
 
 ```bash
-docker compose up -d && cargo build && vhs docs/demo.tape && vhs docs/screenshots.tape
+docker compose up -d && cargo build && vhs docs/demo.tape && vhs docs/screenshots.tape && vhs docs/themes.tape
 ```
+
+A new built-in theme is a TOML file in `src/themes/` plus a line in `BUILTIN`
+(`src/theme.rs`); add it to `docs/themes.tape` and the README gallery.
