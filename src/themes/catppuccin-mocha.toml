@@ -1,0 +1,13 @@
+border_type = "rounded"
+
+[colors]
+border_focus = "#89b4fa"
+border_blur = "#45475a"
+selected_fg = "#1e1e2e"
+selected_bg = "#89b4fa"
+field_name = "#a6e3a1"
+modal_border = "#cba6f7"
+error = "#f38ba8"
+success = "#a6e3a1"
+key_hint = "#f9e2af"
+muted = "#6c7086"

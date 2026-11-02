@@ -137,6 +137,13 @@ pub struct App {
     pub editor_cmd: String,
     pub settings_editor_input: Input,
     pub settings_error: Option<String>,
+    /// Active theme name; the theme itself lives in `theme::get()`.
+    pub theme_name: String,
+    /// Settings popup: whether the theme selector (vs the editor field) is focused.
+    pub settings_on_theme: bool,
+    /// Theme shown while browsing themes in settings, and the one to restore on esc.
+    pub settings_theme: String,
+    settings_theme_before: String,
     pub command_input: Input,
     /// Which matching suggestion is shown, cycled with up/down.
     pub command_idx: usize,
@@ -198,6 +205,15 @@ impl App {
             .or_else(|| std::env::var("EDITOR").ok())
             .unwrap_or_else(|| "vi".to_string());
 
+        let theme_name = cfg.theme.clone().unwrap_or_else(|| "default".into());
+        let theme_error = match crate::theme::load(&theme_name) {
+            Ok(t) => {
+                crate::theme::set(t);
+                None
+            }
+            Err(e) => Some(format!("error: {e:#}; using the default theme")),
+        };
+
         // connect concurrently so N unreachable servers cost one timeout, not N
         let futs = cfg.connections.into_iter().map(|c| async move {
             let source = connect(c.kind, &c.url).await;
@@ -234,7 +250,7 @@ impl App {
             result: None,
             offset: 0,
             query_input: Input::default(),
-            status: String::new(),
+            status: theme_error.unwrap_or_default(),
             should_quit: false,
             editor_request: None,
             pending_edit: None,
@@ -242,6 +258,10 @@ impl App {
             editor_cmd: editor_cmd.clone(),
             settings_editor_input: Input::new(editor_cmd),
             settings_error: None,
+            settings_on_theme: false,
+            settings_theme: theme_name.clone(),
+            settings_theme_before: theme_name.clone(),
+            theme_name,
             command_input: Input::default(),
             command_idx: 0,
             new_conn_name: Input::default(),
@@ -423,6 +443,9 @@ impl App {
         if matches!(self.mode, Mode::Command) {
             return "enter run  tab/→ complete  ↑/↓ suggestions  esc cancel";
         }
+        if matches!(self.mode, Mode::Settings) {
+            return "tab switch_field  ←/→ preview_theme  enter save  esc cancel";
+        }
         if let Some(fe) = &self.field_edit {
             return if fe.input.is_some() {
                 "←/→ move  enter apply  esc cancel  42/true/null/{..} keep_type  \"..\" forces_text"
@@ -456,7 +479,33 @@ impl App {
         if self.screen == Screen::Browse {
             out.extend(self.containers.iter().cloned());
         }
+        out.extend(
+            crate::theme::names()
+                .into_iter()
+                .map(|t| format!("theme {t}")),
+        );
         out
+    }
+
+    /// Loads, applies and optionally saves a theme; errors go to the status line.
+    fn apply_theme(&mut self, name: &str, save: bool) -> bool {
+        match crate::theme::load(name) {
+            Ok(t) => {
+                crate::theme::set(t);
+                if save {
+                    self.theme_name = name.to_string();
+                    self.status = match crate::config::set_theme(name) {
+                        Ok(_) => format!("theme: {name}"),
+                        Err(e) => format!("error: theme applied but not saved: {e}"),
+                    };
+                }
+                true
+            }
+            Err(e) => {
+                self.status = format!("error: {e:#}");
+                false
+            }
+        }
     }
 
     /// The full candidate currently suggested for what's typed, if any.
@@ -494,6 +543,19 @@ impl App {
     }
 
     async fn run_command(&mut self, cmd: &str) {
+        if cmd == "theme" {
+            self.status = format!(
+                "theme: {} (available: {})",
+                self.theme_name,
+                crate::theme::names().join(", ")
+            );
+            return;
+        }
+        // re-reads the file each time, so editing a theme then `:theme <name>` reloads it
+        if let Some(name) = cmd.strip_prefix("theme ") {
+            self.apply_theme(name.trim(), true);
+            return;
+        }
         let find = |names: &[String]| names.iter().position(|n| n.eq_ignore_ascii_case(cmd));
         match cmd.to_lowercase().as_str() {
             "" => {}
@@ -887,13 +949,38 @@ impl App {
     fn start_settings(&mut self) {
         self.settings_editor_input = Input::new(self.editor_cmd.clone());
         self.settings_error = None;
+        self.settings_on_theme = false;
+        self.settings_theme = self.theme_name.clone();
+        self.settings_theme_before = self.theme_name.clone();
         self.mode = Mode::Settings;
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                // undo the live preview
+                let before = self.settings_theme_before.clone();
+                self.apply_theme(&before, false);
                 self.mode = Mode::Normal;
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                self.settings_on_theme = !self.settings_on_theme;
+            }
+            KeyCode::Left | KeyCode::Right if self.settings_on_theme => {
+                let names = crate::theme::names();
+                let i = names
+                    .iter()
+                    .position(|n| *n == self.settings_theme)
+                    .unwrap_or(0);
+                let next = if key.code == KeyCode::Right {
+                    (i + 1) % names.len()
+                } else {
+                    (i + names.len() - 1) % names.len()
+                };
+                self.settings_theme = names[next].clone();
+                let name = self.settings_theme.clone();
+                self.settings_error =
+                    (!self.apply_theme(&name, false)).then(|| std::mem::take(&mut self.status));
             }
             KeyCode::Enter => {
                 let value = self.settings_editor_input.value().trim().to_string();
@@ -901,18 +988,22 @@ impl App {
                     self.settings_error = Some("editor command cannot be empty".into());
                     return;
                 }
-                match crate::config::set_editor(&value) {
+                let saved = crate::config::set_editor(&value)
+                    .and_then(|_| crate::config::set_theme(&self.settings_theme));
+                match saved {
                     Ok(_) => {
                         self.editor_cmd = value;
+                        self.theme_name = self.settings_theme.clone();
                         self.status = "settings saved".into();
                         self.mode = Mode::Normal;
                     }
                     Err(e) => self.settings_error = Some(format!("failed to save: {e}")),
                 }
             }
-            _ => {
+            _ if !self.settings_on_theme => {
                 self.settings_editor_input.handle(key);
             }
+            _ => {}
         }
     }
 

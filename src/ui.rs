@@ -86,14 +86,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let title = Paragraph::new(Line::from(vec![Span::styled(
         format!(" db9s :: {path} "),
         Style::default()
-            .fg(theme::BORDER_FOCUS)
+            .fg(theme::get().border_focus)
             .add_modifier(Modifier::BOLD),
     )]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::BORDER_TYPE)
-            .border_style(Style::default().fg(theme::BORDER_BLUR)),
+            .border_type(theme::get().border_type)
+            .border_style(Style::default().fg(theme::get().border_blur)),
     );
     f.render_widget(title, area);
 }
@@ -103,7 +103,7 @@ fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(
         "> ",
         Style::default()
-            .fg(theme::BORDER_FOCUS)
+            .fg(theme::get().border_focus)
             .add_modifier(Modifier::BOLD),
     )];
     match app.command_suggestion().filter(|s| !s.is_empty()) {
@@ -114,12 +114,12 @@ fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(
                 first,
                 Style::default()
-                    .fg(theme::HELP_TEXT)
+                    .fg(theme::get().muted)
                     .add_modifier(Modifier::REVERSED),
             ));
             spans.push(Span::styled(
                 chars.as_str().to_string(),
-                Style::default().fg(theme::HELP_TEXT),
+                Style::default().fg(theme::get().muted),
             ));
         }
         None => spans.extend(app.command_input.spans(true)),
@@ -128,7 +128,7 @@ fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(spans)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::BORDER_TYPE)
+                .border_type(theme::get().border_type)
                 .border_style(pane_border(true))
                 .title("command"),
         ),
@@ -145,15 +145,15 @@ fn conn_name(app: &App) -> String {
 
 fn selected_style() -> Style {
     Style::default()
-        .fg(theme::SELECTED_FG)
-        .bg(theme::SELECTED_BG)
+        .fg(theme::get().selected_fg)
+        .bg(theme::get().selected_bg)
 }
 
 fn pane_border(focused: bool) -> Style {
     Style::default().fg(if focused {
-        theme::BORDER_FOCUS
+        theme::get().border_focus
     } else {
-        theme::BORDER_BLUR
+        theme::get().border_blur
     })
 }
 
@@ -175,10 +175,10 @@ fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
                 ),
                 Span::styled(
                     format!("[{}]  ", c.kind.label()),
-                    Style::default().fg(theme::DOC_TEXT),
+                    Style::default().fg(theme::get().field_name),
                 ),
-                Span::styled(masked, Style::default().fg(theme::HELP_TEXT)),
-                Span::styled(status, Style::default().fg(theme::ERROR)),
+                Span::styled(masked, Style::default().fg(theme::get().muted)),
+                Span::styled(status, Style::default().fg(theme::get().error)),
             ]);
             let style = if i == app.conn_idx {
                 selected_style()
@@ -191,7 +191,7 @@ fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::BORDER_TYPE)
+            .border_type(theme::get().border_type)
             .border_style(pane_border(true))
             .title("connections  (a add, e edit, d delete, s settings)"),
     );
@@ -224,7 +224,7 @@ fn draw_list(
     let list = List::new(list_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::BORDER_TYPE)
+            .border_type(theme::get().border_type)
             .border_style(pane_border(focused))
             .title(title),
     );
@@ -273,12 +273,12 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, stat
             let mut spans = vec![
                 Span::styled(
                     if changed { "● " } else { "  " },
-                    Style::default().fg(theme::CONFIRM),
+                    Style::default().fg(theme::get().success),
                 ),
                 Span::styled(
                     format!("{k}: "),
                     Style::default()
-                        .fg(theme::DOC_TEXT)
+                        .fg(theme::get().field_name)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -289,7 +289,7 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, stat
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::BORDER_TYPE)
+            .border_type(theme::get().border_type)
             .border_style(pane_border(true))
             .title("edit row"),
     );
@@ -306,7 +306,7 @@ fn draw_rows_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
     };
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_type(theme::BORDER_TYPE)
+        .border_type(theme::get().border_type)
         .border_style(pane_border(focused))
         .title(title);
     let inner = outer.inner(area);
@@ -351,7 +351,7 @@ fn draw_rows_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
                 Span::styled(
                     format!("{col}: "),
                     Style::default()
-                        .fg(theme::DOC_TEXT)
+                        .fg(theme::get().field_name)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(compact(&val)),
@@ -360,11 +360,11 @@ fn draw_rows_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
         let card = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::BORDER_TYPE)
+                .border_type(theme::get().border_type)
                 .border_style(if selected {
-                    Style::default().fg(theme::BORDER_FOCUS)
+                    Style::default().fg(theme::get().border_focus)
                 } else {
-                    Style::default().fg(theme::BORDER_BLUR)
+                    Style::default().fg(theme::get().border_blur)
                 }),
         );
         f.render_widget(card, card_areas[slot]);
@@ -398,7 +398,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ]
                 .concat(),
             ))
-            .style(Style::default().fg(theme::SELECTED_FG)),
+            .style(Style::default().fg(theme::get().selected_fg)),
             area,
         );
         return;
@@ -410,7 +410,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new("y/n").style(
                 Style::default()
-                    .fg(theme::ERROR)
+                    .fg(theme::get().error)
                     .add_modifier(Modifier::BOLD),
             ),
             area,
@@ -421,9 +421,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if !app.status.is_empty() {
         let is_err = app.status.starts_with("error") || app.status.starts_with("failed");
         let color = if is_err {
-            theme::ERROR
+            theme::get().error
         } else {
-            theme::HELP_TEXT
+            theme::get().muted
         };
         let status = Span::styled(app.status.clone(), Style::default().fg(color));
         // errors go first so a long key list never truncates them
@@ -450,18 +450,18 @@ fn help_line(status: &str) -> Line<'static> {
                 spans.push(Span::styled(
                     key.to_string(),
                     Style::default()
-                        .fg(theme::HELP_KEY)
+                        .fg(theme::get().key_hint)
                         .add_modifier(Modifier::BOLD),
                 ));
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     desc.to_string(),
-                    Style::default().fg(theme::HELP_TEXT),
+                    Style::default().fg(theme::get().muted),
                 ));
             }
             None => spans.push(Span::styled(
                 chunk.to_string(),
-                Style::default().fg(theme::HELP_TEXT),
+                Style::default().fg(theme::get().muted),
             )),
         }
     }
@@ -491,7 +491,7 @@ fn modal_block(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::MODAL_BORDER))
+        .border_style(Style::default().fg(theme::get().modal_border))
         .title(title.to_string())
 }
 
@@ -509,7 +509,7 @@ fn draw_confirm_edit_popup(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         "save these changes? y/n",
         Style::default()
-            .fg(theme::CONFIRM)
+            .fg(theme::get().success)
             .add_modifier(Modifier::BOLD),
     ))];
     lines.push(Line::raw(""));
@@ -526,12 +526,12 @@ fn draw_confirm_edit_popup(f: &mut Frame, app: &App) {
             Span::styled(
                 format!("{key}: "),
                 Style::default()
-                    .fg(theme::DOC_TEXT)
+                    .fg(theme::get().field_name)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(old_s, Style::default().fg(theme::ERROR)),
+            Span::styled(old_s, Style::default().fg(theme::get().error)),
             Span::raw(" -> "),
-            Span::styled(new_s, Style::default().fg(theme::CONFIRM)),
+            Span::styled(new_s, Style::default().fg(theme::get().success)),
         ]));
     }
 
@@ -544,10 +544,13 @@ fn draw_confirm_edit_popup(f: &mut Frame, app: &App) {
 }
 
 fn draw_settings_popup(f: &mut Frame, app: &App) {
-    let area = centered(f.area(), 55, 25);
+    let mut area = centered(f.area(), 55, 35);
+    // two 3-line fields + message + borders must fit, whatever the terminal height
+    area.height = area.height.max(10).min(f.area().height);
+    area.y = (f.area().height - area.height) / 2;
     f.render_widget(ratatui::widgets::Clear, area);
 
-    let outer = modal_block("settings (enter save, esc cancel)");
+    let outer = modal_block("settings (tab field, ←/→ theme, enter save, esc cancel)");
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -555,35 +558,55 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(inner);
 
+    let field_style = |focused: bool| {
+        if focused {
+            selected_style()
+        } else {
+            Style::default()
+        }
+    };
     f.render_widget(
-        Paragraph::new(Line::from(app.settings_editor_input.spans(true)))
-            .style(selected_style())
+        Paragraph::new(Line::from(
+            app.settings_editor_input.spans(!app.settings_on_theme),
+        ))
+        .style(field_style(!app.settings_on_theme))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(theme::get().border_type)
+                .title("editor (for row/doc edit)"),
+        ),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(format!("< {} >", app.settings_theme))
+            .style(field_style(app.settings_on_theme))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(theme::BORDER_TYPE)
-                    .title("editor (for row/doc edit)"),
+                    .border_type(theme::get().border_type)
+                    .title("theme (live preview)"),
             ),
-        rows[0],
+        rows[1],
     );
 
-    if let Some(err) = &app.settings_error {
-        f.render_widget(
-            Paragraph::new(err.as_str()).style(Style::default().fg(theme::ERROR)),
-            rows[2],
-        );
-    } else {
-        f.render_widget(
-            Paragraph::new("saved to config.toml, used next time you press 'e'")
-                .style(Style::default().fg(theme::HELP_TEXT)),
-            rows[2],
-        );
-    }
+    let (msg, color) = match &app.settings_error {
+        Some(err) => (err.as_str(), theme::get().error),
+        None => (
+            "saved to config.toml; custom themes go in <config dir>/themes/<name>.toml",
+            theme::get().muted,
+        ),
+    };
+    f.render_widget(
+        Paragraph::new(msg).style(Style::default().fg(color)),
+        rows[3],
+    );
 }
 
 fn draw_add_conn_popup(f: &mut Frame, app: &App) {
@@ -630,7 +653,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::BORDER_TYPE)
+                .border_type(theme::get().border_type)
                 .title("name"),
         ),
         rows[0],
@@ -643,7 +666,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::BORDER_TYPE)
+                .border_type(theme::get().border_type)
                 .title("url"),
         ),
         rows[1],
@@ -655,7 +678,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(theme::BORDER_TYPE)
+                    .border_type(theme::get().border_type)
                     .title("kind (left/right)"),
             ),
         rows[2],
@@ -663,11 +686,11 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
 
     if let Some(msg) = &app.new_conn_error {
         let color = if msg.starts_with("connected") || msg == "connection ok" {
-            theme::CONFIRM
+            theme::get().success
         } else if msg == "connecting..." {
-            theme::SELECTED_FG
+            theme::get().selected_fg
         } else {
-            theme::ERROR
+            theme::get().error
         };
         f.render_widget(
             Paragraph::new(msg.as_str()).style(Style::default().fg(color)),
@@ -683,7 +706,7 @@ fn draw_confirm_popup(f: &mut Frame, text: &str) {
         Paragraph::new(text)
             .style(
                 Style::default()
-                    .fg(theme::CONFIRM)
+                    .fg(theme::get().success)
                     .add_modifier(Modifier::BOLD),
             )
             .block(modal_block("confirm")),
