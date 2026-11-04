@@ -45,6 +45,9 @@ pub struct Connection {
     pub name: String,
     pub kind: Kind,
     pub url: String,
+    /// Refuse every write through this connection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -129,6 +132,7 @@ mod tests {
             name = "rabbit"
             kind = "rabbitmq"
             url = "amqp://localhost/%2F?queues=q"
+            read_only = true
             "#,
         )
         .unwrap();
@@ -137,6 +141,9 @@ mod tests {
         assert_eq!(cfg.connections[1].url, "amqp://localhost/%2F?queues=q");
         let round_trip = toml::to_string(&cfg).unwrap();
         assert!(round_trip.contains("kind = \"rabbitmq\""));
+        assert!(!cfg.connections[0].read_only);
+        assert!(cfg.connections[1].read_only);
+        assert_eq!(round_trip.matches("read_only").count(), 1);
     }
 
     #[test]

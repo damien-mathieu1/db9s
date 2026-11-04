@@ -41,6 +41,7 @@ Keep the diff focused on one change. No unused code, no new warnings.
    the `DataSource` trait (`src/datasource/mod.rs`) in a new module under
    `src/datasource/`. Message brokers (Kafka, NATS, ...) return `true`
    from `is_queue()`: the UI then shows publish/purge and disables edit.
+   Implement `is_read_query()` too, or read-only connections refuse every raw query.
 2. Add a variant to `Kind` in `src/config.rs` (and to `Kind::ALL` / `label()`),
    then an arm in `connect()` in `src/app.rs`. The add-connection form, config
    file and footer hints pick it up from there.

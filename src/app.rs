@@ -1,5 +1,5 @@
 use crate::config::{Config, Kind};
-use crate::datasource::{DataSource, QueryResult};
+use crate::datasource::{DataSource, QueryResult, ReadOnly};
 use crate::input::Input;
 use crate::value::Row;
 use anyhow::Result;
@@ -60,12 +60,15 @@ pub enum AddField {
     Name,
     Url,
     Kind,
+    ReadOnly,
 }
 
 pub struct ConnEntry {
     pub name: String,
     pub kind: Kind,
     pub url: String,
+    /// As saved in the config; `--read-only` comes on top, see `App::force_read_only`.
+    pub read_only: bool,
     pub source: Result<Box<dyn DataSource>>,
 }
 
@@ -155,9 +158,12 @@ pub struct App {
     pub new_conn_error: Option<String>,
     pub edit_target: Option<usize>,
     pub connecting: Option<PendingConnect>,
+    pub new_conn_read_only: bool,
+    /// `--read-only`: every connection of this session, without touching the config.
+    pub force_read_only: bool,
 }
 
-async fn connect(kind: Kind, url: &str) -> Result<Box<dyn DataSource>> {
+async fn connect(kind: Kind, url: &str, read_only: bool) -> Result<Box<dyn DataSource>> {
     // outside the timeout: a secret manager may wait on a Touch ID / GUI prompt
     let url = &crate::secrets::resolve(url).await?;
     use crate::datasource::{
@@ -166,26 +172,37 @@ async fn connect(kind: Kind, url: &str) -> Result<Box<dyn DataSource>> {
     };
     let fut = async {
         Ok(match kind {
-            Kind::Postgres => Box::new(PostgresSource::connect(url).await?) as Box<dyn DataSource>,
+            Kind::Postgres => {
+                Box::new(PostgresSource::connect(url, read_only).await?) as Box<dyn DataSource>
+            }
             Kind::Mongo => Box::new(MongoSource::connect(url).await?),
             Kind::RabbitMq if url.starts_with("amqp") => Box::new(AmqpSource::connect(url).await?),
             Kind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
             Kind::Redis => Box::new(RedisSource::connect(url).await?),
-            Kind::MySql => Box::new(MySqlSource::connect(url).await?),
+            Kind::MySql => Box::new(MySqlSource::connect(url, read_only).await?),
         })
     };
-    tokio::time::timeout(CONNECT_TIMEOUT, fut)
+    let source = tokio::time::timeout(CONNECT_TIMEOUT, fut)
         .await
         .unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
                 "connection timed out after {}s",
                 CONNECT_TIMEOUT.as_secs()
             ))
-        })
+        })?;
+    Ok(if read_only {
+        Box::new(ReadOnly(source))
+    } else {
+        source
+    })
 }
 
-fn spawn_connect(kind: Kind, url: String) -> JoinHandle<Result<Box<dyn DataSource>>> {
-    tokio::spawn(async move { connect(kind, &url).await })
+fn spawn_connect(
+    kind: Kind,
+    url: String,
+    read_only: bool,
+) -> JoinHandle<Result<Box<dyn DataSource>>> {
+    tokio::spawn(async move { connect(kind, &url, read_only).await })
 }
 
 /// A connection attempt running in the background, so the UI never blocks on
@@ -200,7 +217,7 @@ pub struct PendingConnect {
 }
 
 impl App {
-    pub async fn new(cfg: Config) -> Self {
+    pub async fn new(cfg: Config, force_read_only: bool) -> Self {
         let editor_cmd = cfg
             .editor
             .clone()
@@ -218,11 +235,12 @@ impl App {
 
         // connect concurrently so N unreachable servers cost one timeout, not N
         let futs = cfg.connections.into_iter().map(|c| async move {
-            let source = connect(c.kind, &c.url).await;
+            let source = connect(c.kind, &c.url, c.read_only || force_read_only).await;
             ConnEntry {
                 name: c.name,
                 kind: c.kind,
                 url: c.url,
+                read_only: c.read_only,
                 source,
             }
         });
@@ -273,6 +291,8 @@ impl App {
             new_conn_error: None,
             edit_target: None,
             connecting: None,
+            new_conn_read_only: false,
+            force_read_only,
         }
     }
 
@@ -308,6 +328,7 @@ impl App {
         source: Box<dyn DataSource>,
         edit_idx: Option<usize>,
     ) {
+        let read_only = self.new_conn_read_only;
         if let Some(idx) = edit_idx {
             let old_name = self.conns[idx].name.clone();
             if old_name != name {
@@ -317,6 +338,7 @@ impl App {
                 name: name.clone(),
                 kind,
                 url: url.clone(),
+                read_only,
             }) {
                 self.status = format!("connected, but failed to save to config: {e}");
             } else {
@@ -326,6 +348,7 @@ impl App {
                 name,
                 kind,
                 url,
+                read_only,
                 source: Ok(source),
             };
             self.conn_idx = idx;
@@ -334,6 +357,7 @@ impl App {
                 name: name.clone(),
                 kind,
                 url: url.clone(),
+                read_only,
             }) {
                 self.status = format!("connected, but failed to save to config: {e}");
             } else {
@@ -343,6 +367,7 @@ impl App {
                 name,
                 kind,
                 url,
+                read_only,
                 source: Ok(source),
             });
             self.conn_idx = self.conns.len() - 1;
@@ -413,9 +438,15 @@ impl App {
                 self.offset = (self.offset - PAGE_SIZE).max(0);
                 self.load_rows().await;
             }
+            KeyCode::Char('/') if self.rows_focused() && self.is_queue() && self.is_read_only() => {
+                self.status = "read-only connection: publishing is off".into();
+            }
             KeyCode::Char('/') if self.rows_focused() => {
                 self.mode = Mode::Query;
                 self.query_input = Input::default();
+            }
+            KeyCode::Char('e' | 'E' | 'd') if self.rows_focused() && self.is_read_only() => {
+                self.status = "read-only connection: edit and delete are off".into();
             }
             KeyCode::Char('e') | KeyCode::Char('E') if self.rows_focused() && self.is_queue() => {
                 self.status = "rabbitmq messages are read-only".into();
@@ -460,6 +491,12 @@ impl App {
             Screen::Databases => "j/k move  enter open  : command  esc back",
             Screen::Browse => match self.browse_focus {
                 BrowseFocus::Containers => "j/k move+preview  enter/tab rows  : command  esc back",
+                BrowseFocus::Rows if self.is_read_only() && self.is_queue() => {
+                    "j/k move  n/p page  r refresh  tab queues  esc back"
+                }
+                BrowseFocus::Rows if self.is_read_only() => {
+                    "j/k move  / query  n/p page  r refresh  tab containers  esc back"
+                }
                 BrowseFocus::Rows if self.is_queue() => {
                     "j/k move  / publish  d purge queue  n/p page  r refresh  tab queues  esc back"
                 }
@@ -616,6 +653,13 @@ impl App {
     /// Queues (RabbitMQ) get publish/purge instead of edit/delete.
     pub fn is_queue(&self) -> bool {
         self.current_source().is_some_and(|s| s.is_queue())
+    }
+
+    /// Whether what's on screen is read-only, for the header badge and the keys.
+    pub fn is_read_only(&self) -> bool {
+        self.force_read_only
+            || (self.screen != Screen::Connections
+                && self.conns.get(self.conn_idx).is_some_and(|c| c.read_only))
     }
 
     fn rows_focused(&self) -> bool {
@@ -1013,6 +1057,7 @@ impl App {
         self.new_conn_name = Input::default();
         self.new_conn_url = Input::default();
         self.new_conn_kind = Kind::Postgres;
+        self.new_conn_read_only = false;
         self.new_conn_field = AddField::Name;
         self.new_conn_error = None;
         self.edit_target = None;
@@ -1026,6 +1071,7 @@ impl App {
         self.new_conn_name = Input::new(entry.name.clone());
         self.new_conn_url = Input::new(entry.url.clone());
         self.new_conn_kind = entry.kind;
+        self.new_conn_read_only = entry.read_only;
         self.new_conn_field = AddField::Name;
         self.new_conn_error = None;
         self.edit_target = Some(self.conn_idx);
@@ -1073,30 +1119,31 @@ impl App {
                 self.new_conn_field = match self.new_conn_field {
                     AddField::Name => AddField::Url,
                     AddField::Url => AddField::Kind,
-                    AddField::Kind => AddField::Name,
+                    AddField::Kind => AddField::ReadOnly,
+                    AddField::ReadOnly => AddField::Name,
                 };
             }
             KeyCode::BackTab | KeyCode::Up => {
                 self.new_conn_field = match self.new_conn_field {
-                    AddField::Name => AddField::Kind,
+                    AddField::Name => AddField::ReadOnly,
                     AddField::Url => AddField::Name,
                     AddField::Kind => AddField::Url,
+                    AddField::ReadOnly => AddField::Kind,
                 };
             }
             KeyCode::Left | KeyCode::Right if self.new_conn_field == AddField::Kind => {
                 self.new_conn_kind = self.new_conn_kind.next();
             }
-            KeyCode::Enter => {
-                if self.new_conn_field != AddField::Kind {
-                    self.new_conn_field = match self.new_conn_field {
-                        AddField::Name => AddField::Url,
-                        AddField::Url => AddField::Kind,
-                        AddField::Kind => AddField::Kind,
-                    };
-                } else {
-                    self.start_submit_conn();
-                }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.new_conn_field == AddField::ReadOnly =>
+            {
+                self.new_conn_read_only = !self.new_conn_read_only;
             }
+            KeyCode::Enter => match self.new_conn_field {
+                AddField::Name => self.new_conn_field = AddField::Url,
+                AddField::Url => self.new_conn_field = AddField::Kind,
+                AddField::Kind | AddField::ReadOnly => self.start_submit_conn(),
+            },
             _ => match self.new_conn_field {
                 AddField::Name => {
                     self.new_conn_name.handle(key);
@@ -1104,7 +1151,7 @@ impl App {
                 AddField::Url => {
                     self.new_conn_url.handle(key);
                 }
-                AddField::Kind => {}
+                AddField::Kind | AddField::ReadOnly => {}
             },
         }
     }
@@ -1141,7 +1188,7 @@ impl App {
             url: url.clone(),
             save: false,
             edit_idx: None,
-            handle: spawn_connect(kind, url),
+            handle: spawn_connect(kind, url, self.new_conn_read_only || self.force_read_only),
         });
     }
 
@@ -1157,7 +1204,7 @@ impl App {
             url: url.clone(),
             save: true,
             edit_idx: self.edit_target,
-            handle: spawn_connect(kind, url),
+            handle: spawn_connect(kind, url, self.new_conn_read_only || self.force_read_only),
         });
     }
 }

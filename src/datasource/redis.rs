@@ -9,6 +9,62 @@ use redis::{cmd, Client, Value as RValue};
 use serde_json::{json, Map, Value};
 
 const MAX_KEYS: usize = 1000;
+/// What a read-only connection may run. No `SORT`, `EVAL`, `GETEX`...: they can write.
+const READ_COMMANDS: [&str; 53] = [
+    "BITCOUNT",
+    "DBSIZE",
+    "EXISTS",
+    "GET",
+    "GETBIT",
+    "GETRANGE",
+    "HEXISTS",
+    "HGET",
+    "HGETALL",
+    "HKEYS",
+    "HLEN",
+    "HMGET",
+    "HRANDFIELD",
+    "HSCAN",
+    "HSTRLEN",
+    "HVALS",
+    "INFO",
+    "KEYS",
+    "LINDEX",
+    "LLEN",
+    "LPOS",
+    "LRANGE",
+    "MGET",
+    "OBJECT",
+    "PFCOUNT",
+    "PING",
+    "PTTL",
+    "SCAN",
+    "SCARD",
+    "SDIFF",
+    "SINTER",
+    "SISMEMBER",
+    "SMEMBERS",
+    "SMISMEMBER",
+    "SRANDMEMBER",
+    "SSCAN",
+    "STRLEN",
+    "SUNION",
+    "TTL",
+    "TYPE",
+    "XINFO",
+    "XLEN",
+    "XRANGE",
+    "XREVRANGE",
+    "ZCARD",
+    "ZCOUNT",
+    "ZMSCORE",
+    "ZRANGE",
+    "ZRANK",
+    "ZREVRANGE",
+    "ZREVRANK",
+    "ZSCAN",
+    "ZSCORE",
+];
 
 pub struct RedisSource {
     client: Client,
@@ -130,8 +186,16 @@ async fn key_type(con: &mut MultiplexedConnection, key: &str) -> Result<String> 
     Ok(cmd("TYPE").arg(key).query_async(con).await?)
 }
 
+fn is_read_command(raw: &str) -> bool {
+    split_command(raw).is_ok_and(|args| READ_COMMANDS.contains(&args[0].to_uppercase().as_str()))
+}
+
 #[async_trait]
 impl DataSource for RedisSource {
+    fn is_read_query(&self, raw: &str) -> bool {
+        is_read_command(raw)
+    }
+
     /// db0 plus every non-empty logical database (CONFIG is often disabled on managed Redis).
     async fn list_databases(&self) -> Result<Vec<String>> {
         let mut con = self.conn("db0").await?;
@@ -380,7 +444,7 @@ impl DataSource for RedisSource {
 
 #[cfg(test)]
 mod tests {
-    use super::split_command;
+    use super::{is_read_command, split_command};
 
     #[test]
     fn splits_commands_like_a_shell() {
@@ -394,5 +458,17 @@ mod tests {
         );
         assert!(split_command("GET \"oops").is_err());
         assert!(split_command("   ").is_err());
+    }
+
+    #[test]
+    fn only_allowlisted_commands_are_reads() {
+        assert!(is_read_command("hgetall user:1"));
+        assert!(is_read_command("GET a"));
+        assert!(!is_read_command("SET a 1"));
+        assert!(!is_read_command("FLUSHALL"));
+        assert!(!is_read_command("EVAL \"return 1\" 0"));
+        assert!(!is_read_command("SORT l STORE d"));
+        assert!(!is_read_command("GET \"oops"));
+        assert!(!is_read_command(""));
     }
 }

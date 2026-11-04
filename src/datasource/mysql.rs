@@ -17,6 +17,7 @@ impl SqlDialect for MySqlDialect {
         "SELECT CAST(column_name AS CHAR) FROM information_schema.key_column_usage \
          WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY' \
          ORDER BY ordinal_position";
+    const READ_ONLY_SESSION: &'static str = "SET SESSION TRANSACTION READ ONLY";
 
     fn quote(ident: &str) -> String {
         format!("`{}`", ident.replace('`', "``"))

@@ -10,8 +10,11 @@
 //!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 use super::{
     amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
-    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource,
+    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource, QueryResult, ReadOnly,
 };
+use crate::value::Row;
+use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::json;
 
 fn unique(prefix: &str) -> String {
@@ -85,7 +88,7 @@ async fn postgres_conformance() {
     .await
     .unwrap();
 
-    let source = PostgresSource::connect(&url).await.unwrap();
+    let source = PostgresSource::connect(&url, false).await.unwrap();
     let query = format!("SELECT * FROM {table} WHERE name = 'z'");
     exercise(&source, "public", &table, &query).await;
 
@@ -460,9 +463,139 @@ async fn mysql_conformance() {
         .await
         .unwrap();
 
-    let source = MySqlSource::connect(&url).await.unwrap();
+    let source = MySqlSource::connect(&url, false).await.unwrap();
     let query = format!("SELECT * FROM {table} WHERE name = 'z'");
     exercise(&source, "db9s", &table, &query).await;
+
+    sqlx::query(&format!("DROP TABLE {table}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// Fails the test if a write gets past `ReadOnly`.
+struct NoWrites;
+
+#[async_trait]
+impl DataSource for NoWrites {
+    fn is_read_query(&self, raw: &str) -> bool {
+        raw == "read"
+    }
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+    async fn list_containers(&self, _: &str) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+    async fn fetch_rows(&self, _: &str, _: &str, _: i64, _: i64) -> Result<QueryResult> {
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            affected: None,
+        })
+    }
+    async fn run_query(&self, a: &str, b: &str, raw: &str) -> Result<QueryResult> {
+        assert_eq!(raw, "read");
+        self.fetch_rows(a, b, 0, 0).await
+    }
+    async fn delete_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
+        unreachable!("delete reached the source")
+    }
+    async fn update_row(&self, _: &str, _: &str, _: &Row, _: &Row) -> Result<()> {
+        unreachable!("update reached the source")
+    }
+}
+
+#[tokio::test]
+async fn read_only_wrapper_stops_writes_before_the_source() {
+    let source = ReadOnly(Box::new(NoWrites));
+    let row = Row::default();
+    assert!(source.fetch_rows("d", "c", 1, 0).await.is_ok());
+    assert!(source.run_query("d", "c", "read").await.is_ok());
+    assert!(source.run_query("d", "c", "write").await.is_err());
+    assert!(source.delete_row("d", "c", &row).await.is_err());
+    assert!(source.update_row("d", "c", &row, &row).await.is_err());
+}
+
+/// Straight on the SQL source, no `ReadOnly`: only the server's read-only session can refuse.
+async fn server_refuses_writes(source: &dyn DataSource, db: &str, table: &str, write: &str) {
+    let err = source.run_query(db, table, write).await.unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"), "{err}");
+    let rows = source.fetch_rows(db, table, 10, 0).await.unwrap().rows;
+    assert_eq!(rows.len(), 2);
+    let edited = {
+        let mut r = rows[0].clone();
+        r.insert("name".into(), json!("z"));
+        r
+    };
+    assert!(source
+        .update_row(db, table, &rows[0], &edited)
+        .await
+        .is_err());
+    assert!(source.delete_row(db, table, &rows[0]).await.is_err());
+    assert_eq!(
+        source
+            .fetch_rows(db, table, 10, 0)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn postgres_read_only_session() {
+    let Ok(url) = std::env::var("DB9S_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let table = unique("db9s_ro");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::query(&format!(
+        "CREATE TABLE public.{table} (id serial primary key, name text)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO public.{table} (name) VALUES ('a'), ('b')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let source = PostgresSource::connect(&url, true).await.unwrap();
+    let write = format!("with x as (delete from {table} returning *) select * from x");
+    assert!(source.is_read_query(&write));
+    server_refuses_writes(&source, "public", &table, &write).await;
+
+    sqlx::query(&format!("DROP TABLE public.{table}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mysql_read_only_session() {
+    let Ok(url) = std::env::var("DB9S_TEST_MYSQL_URL") else {
+        return;
+    };
+    let table = unique("db9s_ro");
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    sqlx::query(&format!(
+        "CREATE TABLE {table} (id int auto_increment primary key, name text)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!("INSERT INTO {table} (name) VALUES ('a'), ('b')"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let source = MySqlSource::connect(&url, true).await.unwrap();
+    let db = url.rsplit('/').next().unwrap();
+    server_refuses_writes(&source, db, &table, &format!("delete from {table}")).await;
 
     sqlx::query(&format!("DROP TABLE {table}"))
         .execute(&pool)
