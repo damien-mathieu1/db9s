@@ -21,6 +21,8 @@ pub trait SqlDialect: Send + Sync + 'static {
     const LIST_TABLES: &'static str;
     /// Primary key columns in key order, for (schema, table) bound as parameters.
     const PRIMARY_KEY: &'static str;
+    /// Makes the session reject writes, run on each connection of a read-only source.
+    const READ_ONLY_SESSION: &'static str;
 
     fn quote(ident: &str) -> String;
     /// Bind marker for the n-th parameter (1-based), e.g. `$1` or `?`.
@@ -34,6 +36,7 @@ pub trait SqlDialect: Send + Sync + 'static {
 pub struct SqlSource<D: SqlDialect> {
     pool: Pool<D::DB>,
     options: ConnOptions<D::DB>,
+    read_only: bool,
     /// One small pool per database for raw queries, so `select * from users` works
     /// in whatever database is being browsed without per-connection state.
     db_pools: Mutex<HashMap<String, Pool<D::DB>>>,
@@ -51,16 +54,31 @@ where
     for<'r> String: sqlx::Decode<'r, D::DB>,
     usize: sqlx::ColumnIndex<<D::DB as Database>::Row>,
 {
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &str, read_only: bool) -> Result<Self> {
         let options = ConnOptions::<D::DB>::from_str(url)?;
-        let pool = sqlx::pool::PoolOptions::<D::DB>::new()
-            .max_connections(5)
+        let pool = Self::pool_options(5, read_only)
             .connect_with(options.clone())
             .await?;
         Ok(Self {
             pool,
             options,
+            read_only,
             db_pools: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn pool_options(max: u32, read_only: bool) -> sqlx::pool::PoolOptions<D::DB> {
+        let options = sqlx::pool::PoolOptions::<D::DB>::new().max_connections(max);
+        if !read_only {
+            return options;
+        }
+        options.after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query::<D::DB>(D::READ_ONLY_SESSION)
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
         })
     }
 
@@ -93,8 +111,7 @@ where
         if let Some(pool) = self.db_pools.lock().unwrap().get(database) {
             return Ok(pool.clone());
         }
-        let pool = sqlx::pool::PoolOptions::<D::DB>::new()
-            .max_connections(2)
+        let pool = Self::pool_options(2, self.read_only)
             .connect_with(D::with_default_db(self.options.clone(), database))
             .await?;
         self.db_pools
@@ -160,6 +177,14 @@ fn returns_rows(raw: &str) -> bool {
     .contains(&first.as_str())
 }
 
+/// One statement that only reads. The server's read-only session catches what this
+/// can't see, like `WITH x AS (DELETE ...) SELECT`, but a later statement could turn
+/// that session off, hence the single statement.
+// shortcut: refuses a `;` inside a string literal too; parse statements if that gets in the way
+fn is_read_sql(raw: &str) -> bool {
+    returns_rows(raw) && !raw.trim_end().trim_end_matches(';').contains(';')
+}
+
 #[async_trait]
 impl<D: SqlDialect> DataSource for SqlSource<D>
 where
@@ -173,6 +198,10 @@ where
     for<'r> String: sqlx::Decode<'r, D::DB>,
     usize: sqlx::ColumnIndex<<D::DB as Database>::Row>,
 {
+    fn is_read_query(&self, raw: &str) -> bool {
+        is_read_sql(raw)
+    }
+
     async fn list_databases(&self) -> Result<Vec<String>> {
         self.names(D::LIST_DATABASES, &[]).await
     }
@@ -255,7 +284,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::returns_rows;
+    use super::{is_read_sql, returns_rows};
 
     #[test]
     fn detects_queries_that_return_rows() {
@@ -264,5 +293,19 @@ mod tests {
         assert!(returns_rows("show tables"));
         assert!(!returns_rows("update t set a = 1"));
         assert!(!returns_rows(""));
+    }
+
+    #[test]
+    fn read_sql_is_one_read_statement() {
+        assert!(is_read_sql("select * from t"));
+        assert!(is_read_sql("  SELECT 1 ;  \n"));
+        assert!(is_read_sql("explain select 1"));
+        assert!(!is_read_sql("update t set a = 1"));
+        assert!(!is_read_sql("delete from t"));
+        assert!(!is_read_sql("drop table t"));
+        assert!(!is_read_sql("set default_transaction_read_only = off"));
+        assert!(!is_read_sql("select 1; delete from t"));
+        assert!(!is_read_sql("select 1; commit; delete from t;"));
+        assert!(!is_read_sql(""));
     }
 }

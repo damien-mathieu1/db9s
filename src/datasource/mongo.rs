@@ -38,8 +38,25 @@ impl MongoSource {
     }
 }
 
+/// A find filter can't write; a pipeline can, but only through a `$out` or `$merge` stage.
+fn is_read_query(raw: &str) -> bool {
+    let raw = raw.trim();
+    if !raw.starts_with('[') {
+        return true;
+    }
+    serde_json::from_str::<Vec<serde_json::Value>>(raw).is_ok_and(|stages| {
+        !stages
+            .iter()
+            .any(|s| s.get("$out").is_some() || s.get("$merge").is_some())
+    })
+}
+
 #[async_trait]
 impl DataSource for MongoSource {
+    fn is_read_query(&self, raw: &str) -> bool {
+        is_read_query(raw)
+    }
+
     async fn list_databases(&self) -> Result<Vec<String>> {
         Ok(self.client.list_database_names().await?)
     }
@@ -150,4 +167,20 @@ fn id_filter(id: &serde_json::Value) -> Result<mongodb::bson::Bson> {
         }
     }
     Ok(json_to_bson(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_read_query;
+
+    #[test]
+    fn pipelines_that_write_are_not_read_queries() {
+        assert!(is_read_query(""));
+        assert!(is_read_query(r#"{"name": "$out"}"#));
+        assert!(is_read_query(r#"[{"$match": {"name": "$out"}}]"#));
+        assert!(!is_read_query(r#"[{"$match": {}}, {"$out": "t"}]"#));
+        assert!(!is_read_query(r#" [{"$merge": {"into": "t"}}]"#));
+        assert!(!is_read_query(r#"[{"\u0024out": "t"}]"#));
+        assert!(!is_read_query("[not json"));
+    }
 }

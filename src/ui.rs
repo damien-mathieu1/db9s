@@ -83,13 +83,16 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or_default()
         ),
     };
-    let title = Paragraph::new(Line::from(vec![Span::styled(
+    let mut spans = vec![Span::styled(
         format!(" db9s :: {path} "),
         Style::default()
             .fg(theme::get().border_focus)
             .add_modifier(Modifier::BOLD),
-    )]))
-    .block(
+    )];
+    if app.is_read_only() {
+        spans.push(read_only_badge());
+    }
+    let title = Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(theme::get().border_type)
@@ -99,6 +102,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// k9s-style command bar: `> typed` followed by the greyed rest of the suggestion.
+fn read_only_badge() -> Span<'static> {
+    Span::styled(
+        "READ-ONLY ",
+        Style::default()
+            .fg(theme::get().error)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(
         "> ",
@@ -177,6 +189,11 @@ fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
                     format!("[{}]  ", c.kind.label()),
                     Style::default().fg(theme::get().field_name),
                 ),
+                if c.read_only || app.force_read_only {
+                    read_only_badge()
+                } else {
+                    Span::raw("")
+                },
                 Span::styled(masked, Style::default().fg(theme::get().muted)),
                 Span::styled(status, Style::default().fg(theme::get().error)),
             ]);
@@ -612,7 +629,7 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
 fn draw_add_conn_popup(f: &mut Frame, app: &App) {
     use crate::app::AddField;
 
-    let area = centered(f.area(), 60, 40);
+    let area = centered(f.area(), 60, 60);
     f.render_widget(ratatui::widgets::Clear, area);
 
     let base = if app.edit_target.is_some() {
@@ -671,6 +688,10 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
         ),
         rows[1],
     );
+    let last_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[2]);
     let kind_label = format!("< {} >", app.new_conn_kind.label());
     f.render_widget(
         Paragraph::new(kind_label)
@@ -681,7 +702,23 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
                     .border_type(theme::get().border_type)
                     .title("kind (left/right)"),
             ),
-        rows[2],
+        last_row[0],
+    );
+    let read_only_label = if app.new_conn_read_only {
+        "< on >"
+    } else {
+        "< off >"
+    };
+    f.render_widget(
+        Paragraph::new(read_only_label)
+            .style(field_style(AddField::ReadOnly))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(theme::get().border_type)
+                    .title("read-only (space)"),
+            ),
+        last_row[1],
     );
 
     if let Some(msg) = &app.new_conn_error {

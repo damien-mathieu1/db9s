@@ -40,6 +40,9 @@ struct Args {
     /// One-off MySQL / MariaDB url, added as a connection named "mysql"
     #[arg(long)]
     mysql: Option<String>,
+    /// Open every connection read-only for this session, whatever the config says
+    #[arg(long)]
+    read_only: bool,
 }
 
 #[tokio::main]
@@ -52,6 +55,7 @@ async fn main() -> Result<()> {
             name: "postgres".into(),
             kind: config::Kind::Postgres,
             url,
+            read_only: false,
         });
     }
     if let Some(url) = args.mongo {
@@ -59,6 +63,7 @@ async fn main() -> Result<()> {
             name: "mongo".into(),
             kind: config::Kind::Mongo,
             url,
+            read_only: false,
         });
     }
     if let Some(url) = args.rabbitmq {
@@ -66,6 +71,7 @@ async fn main() -> Result<()> {
             name: "rabbitmq".into(),
             kind: config::Kind::RabbitMq,
             url,
+            read_only: false,
         });
     }
     if let Some(url) = args.redis {
@@ -73,6 +79,7 @@ async fn main() -> Result<()> {
             name: "redis".into(),
             kind: config::Kind::Redis,
             url,
+            read_only: false,
         });
     }
     if let Some(url) = args.mysql {
@@ -80,10 +87,11 @@ async fn main() -> Result<()> {
             name: "mysql".into(),
             kind: config::Kind::MySql,
             url,
+            read_only: false,
         });
     }
 
-    let app = App::new(cfg).await;
+    let app = App::new(cfg, args.read_only).await;
     run(app).await
 }
 
