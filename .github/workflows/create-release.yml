@@ -115,3 +115,72 @@ jobs:
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: [create-release, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.create-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: damien-mathieu1/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/assets" --pattern 'db9s-*.tar.gz'
+
+      - name: Generate formula
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          sha() { sha256sum "$RUNNER_TEMP/assets/db9s-$TAG-$1.tar.gz" | cut -d' ' -f1; }
+          mkdir -p Formula
+          cat > Formula/db9s.rb <<EOF
+          class Db9s < Formula
+            desc "Terminal UI to browse and edit Postgres, MySQL, MongoDB, Redis and RabbitMQ"
+            homepage "https://github.com/$GITHUB_REPOSITORY"
+            version "${TAG#v}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "$base/db9s-$TAG-aarch64-apple-darwin.tar.gz"
+                sha256 "$(sha aarch64-apple-darwin)"
+              else
+                url "$base/db9s-$TAG-x86_64-apple-darwin.tar.gz"
+                sha256 "$(sha x86_64-apple-darwin)"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "$base/db9s-$TAG-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "$(sha aarch64-unknown-linux-gnu)"
+              else
+                url "$base/db9s-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "$(sha x86_64-unknown-linux-gnu)"
+              end
+            end
+
+            def install
+              bin.install "db9s"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/db9s --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/db9s.rb
+          git diff --cached --quiet || git commit -m "chore: bump db9s ${TAG#v}"
+          git push origin HEAD:main

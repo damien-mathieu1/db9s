@@ -13,6 +13,12 @@ A k9s-style terminal UI to browse, query, and edit your databases and message qu
 ## Installation
 
 ```bash
+brew install damien-mathieu1/tap/db9s
+```
+
+Or with Cargo:
+
+```bash
 cargo install db9s
 ```
 
