@@ -61,6 +61,8 @@ go to **Actions → Create Release → Run workflow** on `main`. It:
    (`cliff.toml`, same as git-cliff),
 4. builds Linux/macOS/Windows binaries and attaches them to the release,
 5. publishes to crates.io (needs the `CARGO_REGISTRY_TOKEN` repo secret).
+6. updates the formula in `damien-mathieu1/homebrew-tap` (needs the
+   `TAP_DEPLOY_KEY` repo secret: private half of a write deploy key on the tap).
 
 ## Screenshots
 

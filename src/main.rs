@@ -21,6 +21,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "db9s",
+    version,
     about = "k9s-style TUI browser for Postgres, MySQL, MongoDB, Redis and RabbitMQ"
 )]
 struct Args {
