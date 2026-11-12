@@ -1,14 +1,16 @@
 //! Desktop frontend: the same `App`, screens and keys as the TUI, drawn with GPUI.
+mod state;
+
 use db9s_core::app::{AddField, App, BrowseFocus, FieldEdit, Mode, Screen};
 use db9s_core::datasource::Sort;
 use db9s_core::input::Input;
 use db9s_core::key::{KeyCode, KeyEvent};
 use db9s_core::theme::{self, BorderType, Color};
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, Application, Bounds, Context, CursorStyle, Div,
-    FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions,
+    div, point, prelude::*, px, rgb, size, uniform_list, Application, Bounds, ClipboardItem,
+    Context, CursorStyle, Div, FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ScrollHandle, ScrollStrategy, SharedString, Task,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -16,9 +18,15 @@ use std::time::Duration;
 
 const BG: u32 = 0x1a1b1e;
 const FG: u32 = 0xd4d4d4;
+/// At zoom 1 (14px text); everything sized in px scales with the zoom.
 const LINE_HEIGHT: f32 = 20.;
 /// Menlo advance at text_sm (14px), to size columns from their content.
 const CHAR_WIDTH: f32 = 8.5;
+const ZOOMS: (f32, f32) = (0.6, 2.5);
+/// Terminal editors: they need a terminal, which a window doesn't have.
+const TERMINAL_EDITORS: [&str; 9] = [
+    "vi", "vim", "nvim", "nano", "micro", "hx", "helix", "kak", "joe",
+];
 const MIN_COL_WIDTH: f32 = 40.;
 
 fn main() {
@@ -27,17 +35,24 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let cfg = db9s_core::config::load().unwrap_or_default();
     let app = rt.block_on(App::new(cfg, read_only));
+    let saved = state::load();
 
     Application::new().run(move |cx: &mut gpui::App| {
-        let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+        let (w, h) = saved.window.unwrap_or((1200., 780.));
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| Db9s::new(app, rt, cx));
+                let view = cx.new(|cx| Db9s::new(app, rt, saved, cx));
                 window.focus(&view.read(cx).focus);
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    weak.update(cx, |v, _| v.save_state()).ok();
+                    true
+                });
                 view
             },
         )
@@ -62,12 +77,28 @@ struct Db9s {
     /// Kept across rows, so the same field stays open while moving through a table.
     unfolded: HashSet<String>,
     tree_scroll: UniformListScrollHandle,
+    /// Horizontal scroll of the grid, moved to keep the edited cell in view.
+    grid_scroll: ScrollHandle,
+    font: SharedString,
+    zoom: f32,
+    /// Last rendered window size, saved on quit.
+    window_size: (f32, f32),
+    /// `E`: the GUI editor running on a row's temp file.
+    editing: Option<(
+        tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+        db9s_core::app::EditorRequest,
+    )>,
     _poll: Task<()>,
 }
 
 impl Db9s {
-    fn new(app: App, rt: tokio::runtime::Runtime, cx: &mut Context<Self>) -> Self {
-        // same 100ms tick as the TUI loop, for background connection attempts
+    fn new(
+        app: App,
+        rt: tokio::runtime::Runtime,
+        saved: state::GuiState,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // same 100ms tick as the TUI loop, for background database calls and `E`
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(100))
@@ -77,11 +108,28 @@ impl Db9s {
                     this.rt.block_on(this.app.poll());
                     cx.notify();
                 }
+                if this.editing.as_ref().is_some_and(|(h, _)| h.is_finished()) {
+                    this.finish_editing();
+                    cx.notify();
+                }
             });
             if alive.is_err() {
                 break;
             }
         });
+        // Ctrl-C in the terminal that started it: quit like Cmd-Q, state saved
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        rt.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            if rx.await.is_ok() {
+                let _ = this.update(cx, |this, cx| this.quit(cx));
+            }
+        })
+        .detach();
         Self {
             app,
             rt,
@@ -90,32 +138,127 @@ impl Db9s {
             db_scroll: Default::default(),
             container_scroll: Default::default(),
             row_scroll: Default::default(),
-            col_widths: HashMap::new(),
+            col_widths: saved.col_widths,
             resizing: None,
             unfolded: HashSet::new(),
             tree_scroll: Default::default(),
+            grid_scroll: ScrollHandle::new(),
+            font: saved.font.unwrap_or_else(|| "Menlo".into()).into(),
+            zoom: saved.zoom.unwrap_or(1.).clamp(ZOOMS.0, ZOOMS.1),
+            window_size: saved.window.unwrap_or((1200., 780.)),
+            editing: None,
             _poll: poll,
         }
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if ev.keystroke.modifiers.platform && ev.keystroke.key == "q" {
-            cx.quit();
+        let k = &ev.keystroke;
+        if k.modifiers.platform {
+            match k.key.as_str() {
+                "q" => self.quit(cx),
+                "c" => self.copy(k.modifiers.shift, cx),
+                "=" | "+" => self.zoom = (self.zoom + 0.1).min(ZOOMS.1),
+                "-" => self.zoom = (self.zoom - 0.1).max(ZOOMS.0),
+                "0" => self.zoom = 1.,
+                _ => return,
+            }
+            cx.notify();
             return;
         }
-        let Some(key) = to_core_key(&ev.keystroke) else {
+        let Some(key) = to_core_key(k) else {
             return;
         };
         // returns at once: database calls run in the background, applied by the poll tick
         self.rt.block_on(self.app.handle_key(key));
         if let Some(req) = self.app.editor_request.take() {
-            let _ = std::fs::remove_file(&req.tmp_path);
-            self.app.status = "error: E ($EDITOR) is TUI-only for now, use e".into();
+            self.open_editor(req);
         }
         if self.app.should_quit {
-            cx.quit();
+            self.quit(cx);
         }
         cx.notify();
+    }
+
+    fn save_state(&self) {
+        let state = state::GuiState {
+            col_widths: self.col_widths.clone(),
+            window: Some(self.window_size),
+            font: Some(self.font.to_string()),
+            zoom: Some(self.zoom),
+        };
+        // shortcut: a failed save only loses layout, not data; surface it if users ask
+        let _ = state::save(&state);
+    }
+
+    fn quit(&self, cx: &mut Context<Self>) {
+        self.save_state();
+        cx.quit();
+    }
+
+    /// Cmd-C: the selected row as JSON; Cmd-Shift-C: the whole page as CSV.
+    fn copy(&mut self, page: bool, cx: &mut Context<Self>) {
+        let Some(res) = &self.app.result else {
+            return;
+        };
+        let (text, what) = if page {
+            (
+                db9s_core::export::to_csv(res),
+                format!("{} rows as CSV", res.rows.len()),
+            )
+        } else {
+            let Some(row) = res.rows.get(self.app.row_idx) else {
+                return;
+            };
+            (
+                serde_json::to_string_pretty(row).unwrap_or_default(),
+                "row as JSON".to_string(),
+            )
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.app.status = format!("copied {what}");
+    }
+
+    /// `E` in a window: the configured editor must be a GUI one that waits, like
+    /// `code --wait` or `zed --wait`; the result comes back through the poll tick.
+    fn open_editor(&mut self, req: db9s_core::app::EditorRequest) {
+        let mut words = self.app.editor_cmd.split_whitespace().map(String::from);
+        let program = words.next().unwrap_or_default();
+        let name = std::path::Path::new(&program)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if TERMINAL_EDITORS.contains(&name.as_str()) {
+            let _ = std::fs::remove_file(&req.tmp_path);
+            self.app.status = format!(
+                "error: {name} needs a terminal; set a GUI editor in settings (s), e.g. \"code --wait\""
+            );
+            return;
+        }
+        let args: Vec<String> = words.collect();
+        let path = req.tmp_path.clone();
+        let handle = self.rt.spawn_blocking(move || {
+            std::process::Command::new(&program)
+                .args(&args)
+                .arg(&path)
+                .status()
+        });
+        self.app.status = format!("editing in {name}… (close the file to come back)");
+        self.editing = Some((handle, req));
+    }
+
+    fn finish_editing(&mut self) {
+        let Some((handle, req)) = self.editing.take() else {
+            return;
+        };
+        let status = self.rt.block_on(handle);
+        let content = std::fs::read_to_string(&req.tmp_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&req.tmp_path);
+        match status {
+            Ok(Ok(s)) if s.success() => self.app.finish_external_edit(&content, req.original),
+            Ok(Ok(_)) => self.app.status = "editor exited with an error, edit discarded".into(),
+            Ok(Err(e)) => self.app.status = format!("error: failed to launch editor: {e}"),
+            Err(e) => self.app.status = format!("error: editor task failed: {e}"),
+        }
     }
 }
 
@@ -368,7 +511,11 @@ fn compact(v: &serde_json::Value) -> String {
 }
 
 impl Render for Db9s {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = window.bounds().size;
+        self.window_size = (f32::from(size.width), f32::from(size.height));
+        // rem-based sizes (text, spacing) follow the zoom; px ones are scaled by hand
+        window.set_rem_size(px(16. * self.zoom));
         let p = palette();
         let app = &self.app;
         let mut root = div()
@@ -387,9 +534,9 @@ impl Render for Db9s {
             .p_2()
             .bg(rgb(BG))
             .text_color(rgb(FG))
-            .font_family("Menlo")
+            .font_family(self.font.clone())
             .text_sm()
-            .line_height(px(LINE_HEIGHT))
+            .line_height(px(LINE_HEIGHT * self.zoom))
             .child(header(app, &p));
         if matches!(app.mode, Mode::Command) {
             root = root.child(command_prompt(app, &p));
@@ -480,13 +627,13 @@ impl Db9s {
         self.col_widths
             .get(col)
             .copied()
-            .unwrap_or_else(|| auto_width(col, rows))
+            .unwrap_or_else(|| auto_width(col, rows, CHAR_WIDTH * self.zoom))
     }
 }
 
 /// A column sized to its name and the first rows' values, capped so one long JSON
 /// blob doesn't take the whole screen.
-fn auto_width(col: &str, rows: &[db9s_core::value::Row]) -> f32 {
+fn auto_width(col: &str, rows: &[db9s_core::value::Row], char_width: f32) -> f32 {
     let longest = rows
         .iter()
         .take(50)
@@ -495,7 +642,7 @@ fn auto_width(col: &str, rows: &[db9s_core::value::Row]) -> f32 {
         .chain([col.chars().count()])
         .max()
         .unwrap_or(0);
-    (longest.clamp(4, 40) as f32 * CHAR_WIDTH + 16.).max(MIN_COL_WIDTH)
+    (longest.clamp(4, 40) as f32 * char_width + 16.).max(MIN_COL_WIDTH)
 }
 
 impl Db9s {
@@ -528,6 +675,7 @@ impl Db9s {
             .map(|c| self.col_width(c, &res.rows))
             .collect();
         let total: f32 = widths.iter().sum();
+        self.scroll_to_edited_cell(&res.columns, &widths);
         let header = div()
             .flex()
             .flex_row()
@@ -681,6 +829,7 @@ impl Db9s {
                 .flex_1()
                 .min_h_0()
                 .overflow_x_scroll()
+                .track_scroll(&self.grid_scroll)
                 .child(
                     div()
                         .flex()
@@ -797,6 +946,33 @@ impl Db9s {
                     (more > 0).then(|| line(vec![styled(format!("… {more} more"), p.muted)])),
                 ),
         )
+    }
+
+    /// While a row is field-edited, scrolls the grid sideways just enough to show the
+    /// current field's column.
+    fn scroll_to_edited_cell(&self, columns: &[String], widths: &[f32]) {
+        let Some(fe) = self.app.field_edit.as_ref().filter(|fe| !fe.insert) else {
+            return;
+        };
+        let Some(field) = fe.edited.keys().nth(fe.idx) else {
+            return;
+        };
+        let Some(i) = columns.iter().position(|c| c == field) else {
+            return;
+        };
+        let start: f32 = widths[..i].iter().sum();
+        let end = start + widths[i];
+        let offset = self.grid_scroll.offset();
+        let view = f32::from(self.grid_scroll.bounds().size.width);
+        let shown = -f32::from(offset.x);
+        let target = if start < shown {
+            start
+        } else if view > 0. && end > shown + view {
+            end - view
+        } else {
+            return;
+        };
+        self.grid_scroll.set_offset(point(px(-target), offset.y));
     }
 
     fn on_resize_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1325,10 +1501,10 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"id": 22, "bio": "{}"}}"#, "y".repeat(500)))
                 .unwrap(),
         ];
-        assert_eq!(auto_width("id", &rows), 4. * CHAR_WIDTH + 16.);
-        assert_eq!(auto_width("bio", &rows), 40. * CHAR_WIDTH + 16.);
+        assert_eq!(auto_width("id", &rows, CHAR_WIDTH), 4. * CHAR_WIDTH + 16.);
+        assert_eq!(auto_width("bio", &rows, CHAR_WIDTH), 40. * CHAR_WIDTH + 16.);
         assert_eq!(
-            auto_width("a_long_column_name", &[]),
+            auto_width("a_long_column_name", &[], CHAR_WIDTH),
             18. * CHAR_WIDTH + 16.
         );
     }
@@ -1378,7 +1554,7 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"name": "Mouse", "tags": ["a", "b"]}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
         cx.run_until_parked();
         let bounds = cx.debug_bounds("tree-tags").expect("tags line is rendered");
         cx.simulate_click(bounds.center(), Default::default());
@@ -1399,7 +1575,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut app = rt.block_on(App::new(Default::default(), false));
         app.mode = Mode::Normal; // no connections opens the add-connection form
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
         let typing = |text: &str| {
             let keys: Vec<KeyEvent> = text
                 .chars()
@@ -1444,7 +1620,7 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"id": 1, "name": "Mouse"}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
         view.update(cx, |v, cx| {
             for k in [
                 KeyCode::Char('e'),
@@ -1483,13 +1659,52 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
         cx.run_until_parked();
         let head = cx.debug_bounds("head-id").expect("header is rendered");
         cx.simulate_click(head.center(), Default::default());
         cx.run_until_parked();
         view.read_with(cx, |v, _| {
             assert_eq!(v.app.status, "error: this backend can't sort")
+        });
+    }
+
+    /// Cmd-C copies the selected row, Cmd-Shift-C the page; Cmd +/-/0 zoom; `E` with
+    /// a terminal editor is refused instead of hanging on a terminal that isn't there.
+    #[gpui::test]
+    fn cmd_keys_copy_and_zoom(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.editor_cmd = "nvim".into();
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![serde_json::from_str(r#"{"id": 1, "name": "a,b"}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
+        cx.update(|window, cx| window.focus(&view.read(cx).focus));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert!(copied.contains("\"name\": \"a,b\""), "{copied}");
+        cx.simulate_keystrokes("cmd-shift-c");
+        let csv = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert_eq!(csv, "id,name\r\n1,\"a,b\"\r\n");
+        cx.simulate_keystrokes("cmd-= cmd-=");
+        view.read_with(cx, |v, _| assert!((v.zoom - 1.2).abs() < 1e-4));
+        cx.simulate_keystrokes("cmd-0");
+        view.read_with(cx, |v, _| assert_eq!(v.zoom, 1.));
+        cx.simulate_keystrokes("shift-e");
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.app.status.contains("nvim needs a terminal"),
+                "{}",
+                v.app.status
+            );
+            assert!(v.editing.is_none());
         });
     }
 

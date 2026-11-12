@@ -11,7 +11,9 @@ publish = false
 db9s-core = { path = "../db9s-core" }
 # runtime_shaders: no Xcode Metal Toolchain needed to build (shaders compile at startup)
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]

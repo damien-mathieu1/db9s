@@ -1874,8 +1874,10 @@ dependencies = [
 name = "db9s-gui"
 version = "2026.11.4"
 dependencies = [
+ "anyhow",
  "db9s-core",
  "gpui",
+ "serde",
  "serde_json",
  "tokio",
 ]
