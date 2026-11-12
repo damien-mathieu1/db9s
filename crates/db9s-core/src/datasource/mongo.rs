@@ -1,4 +1,4 @@
-use super::{DataSource, QueryResult};
+use super::{DataSource, QueryResult, Sort};
 use crate::value::{bson_to_json, json_to_bson, Row};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -14,6 +14,31 @@ impl MongoSource {
         let client = Client::with_uri_str(url).await?;
         client.list_database_names().await?;
         Ok(Self { client })
+    }
+
+    async fn page(
+        &self,
+        database: &str,
+        container: &str,
+        limit: i64,
+        offset: i64,
+        sort: Option<&Sort>,
+    ) -> Result<QueryResult> {
+        let coll = self
+            .client
+            .database(database)
+            .collection::<mongodb::bson::Document>(container);
+        let opts = FindOptions::builder()
+            .limit(limit)
+            .skip(offset as u64)
+            .sort(sort.map(|s| doc! { s.column.as_str(): if s.desc { -1 } else { 1 } }))
+            .build();
+        let mut cursor = coll.find(doc! {}).with_options(opts).await?;
+        let mut docs = vec![];
+        while let Some(d) = cursor.try_next().await? {
+            docs.push(d);
+        }
+        Ok(Self::rows_to_result(docs))
     }
 
     fn rows_to_result(docs: Vec<mongodb::bson::Document>) -> QueryResult {
@@ -76,20 +101,32 @@ impl DataSource for MongoSource {
         limit: i64,
         offset: i64,
     ) -> Result<QueryResult> {
+        self.page(database, container, limit, offset, None).await
+    }
+
+    fn can_sort(&self) -> bool {
+        true
+    }
+
+    async fn fetch_sorted(
+        &self,
+        database: &str,
+        container: &str,
+        limit: i64,
+        offset: i64,
+        sort: &Sort,
+    ) -> Result<QueryResult> {
+        self.page(database, container, limit, offset, Some(sort))
+            .await
+    }
+
+    async fn count_rows(&self, database: &str, container: &str) -> Result<Option<u64>> {
         let coll = self
             .client
             .database(database)
             .collection::<mongodb::bson::Document>(container);
-        let opts = FindOptions::builder()
-            .limit(limit)
-            .skip(offset as u64)
-            .build();
-        let mut cursor = coll.find(doc! {}).with_options(opts).await?;
-        let mut docs = vec![];
-        while let Some(d) = cursor.try_next().await? {
-            docs.push(d);
-        }
-        Ok(Self::rows_to_result(docs))
+        // metadata count: instant on big collections, unlike count_documents
+        Ok(Some(coll.estimated_document_count().await?))
     }
 
     async fn run_query(&self, database: &str, container: &str, raw: &str) -> Result<QueryResult> {

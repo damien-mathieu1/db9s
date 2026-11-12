@@ -1,7 +1,7 @@
 //! One generic engine for every SQL database (Postgres, MySQL, ...): listing, paging,
 //! raw queries, and edit/delete by the table's real primary key. A new SQL backend only
 //! implements `SqlDialect`: identifier quoting, placeholders, catalog queries, row decoding.
-use super::{DataSource, QueryResult};
+use super::{DataSource, QueryResult, Sort};
 use crate::value::Row;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -52,6 +52,7 @@ where
     for<'q> bool: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'q> Option<String>: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'r> String: sqlx::Decode<'r, D::DB>,
+    for<'r> i64: sqlx::Decode<'r, D::DB>,
     usize: sqlx::ColumnIndex<<D::DB as Database>::Row>,
 {
     pub async fn connect(url: &str, read_only: bool) -> Result<Self> {
@@ -148,6 +149,26 @@ where
         Ok((clauses.join(" AND "), values))
     }
 
+    async fn page(
+        &self,
+        database: &str,
+        table: &str,
+        limit: i64,
+        offset: i64,
+        sort: Option<&Sort>,
+    ) -> Result<QueryResult> {
+        let order = sort.map_or(String::new(), |s| {
+            let dir = if s.desc { "DESC" } else { "ASC" };
+            format!(" ORDER BY {} {dir}", D::quote(&s.column))
+        });
+        let sql = format!(
+            "SELECT * FROM {}{order} LIMIT {limit} OFFSET {offset}",
+            Self::table(database, table)
+        );
+        let rows = sqlx::query::<D::DB>(&sql).fetch_all(&self.pool).await?;
+        Ok(Self::to_result(&rows))
+    }
+
     async fn execute(&self, sql: &str, values: &[Value]) -> Result<()> {
         let mut q = sqlx::query::<D::DB>(sql);
         for v in values {
@@ -196,6 +217,7 @@ where
     for<'q> bool: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'q> Option<String>: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'r> String: sqlx::Decode<'r, D::DB>,
+    for<'r> i64: sqlx::Decode<'r, D::DB>,
     usize: sqlx::ColumnIndex<<D::DB as Database>::Row>,
 {
     fn is_read_query(&self, raw: &str) -> bool {
@@ -217,12 +239,28 @@ where
         limit: i64,
         offset: i64,
     ) -> Result<QueryResult> {
-        let sql = format!(
-            "SELECT * FROM {} LIMIT {limit} OFFSET {offset}",
-            Self::table(database, table)
-        );
-        let rows = sqlx::query::<D::DB>(&sql).fetch_all(&self.pool).await?;
-        Ok(Self::to_result(&rows))
+        self.page(database, table, limit, offset, None).await
+    }
+
+    fn can_sort(&self) -> bool {
+        true
+    }
+
+    async fn fetch_sorted(
+        &self,
+        database: &str,
+        table: &str,
+        limit: i64,
+        offset: i64,
+        sort: &Sort,
+    ) -> Result<QueryResult> {
+        self.page(database, table, limit, offset, Some(sort)).await
+    }
+
+    async fn count_rows(&self, database: &str, table: &str) -> Result<Option<u64>> {
+        let sql = format!("SELECT COUNT(*) FROM {}", Self::table(database, table));
+        let row = sqlx::query::<D::DB>(&sql).fetch_one(&self.pool).await?;
+        Ok(Some(row.try_get::<i64, _>(0usize)? as u64))
     }
 
     async fn run_query(&self, database: &str, _table: &str, raw: &str) -> Result<QueryResult> {

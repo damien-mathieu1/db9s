@@ -1,5 +1,5 @@
 use crate::config::{Config, Kind};
-use crate::datasource::{DataSource, QueryResult, ReadOnly};
+use crate::datasource::{DataSource, QueryResult, ReadOnly, Sort};
 use crate::input::Input;
 use crate::key::{KeyCode, KeyEvent};
 use crate::value::Row;
@@ -126,6 +126,10 @@ pub struct App {
     pub containers: Vec<String>,
     pub result: Option<QueryResult>,
     pub offset: i64,
+    /// Server-side order of the rows pane, set with `:sort <column> [desc]`.
+    pub sort: Option<Sort>,
+    /// Rows in the current container, when the backend counts them.
+    pub total: Option<u64>,
 
     pub query_input: Input,
     pub status: String,
@@ -220,7 +224,8 @@ enum Done {
     Databases(Vec<String>),
     Containers(Vec<String>),
     /// Rows of the current container; `true` focuses the rows pane once they're in.
-    Rows(QueryResult, bool),
+    /// ...and the container's total row count, when known.
+    Rows(QueryResult, bool, Option<u64>),
     Query(QueryResult),
     Saved,
     Deleted,
@@ -283,6 +288,8 @@ impl App {
             containers: vec![],
             result: None,
             offset: 0,
+            sort: None,
+            total: None,
             query_input: Input::default(),
             status: theme_error.unwrap_or_default(),
             should_quit: false,
@@ -348,14 +355,16 @@ impl App {
                 self.containers = c;
                 self.container_idx = 0;
                 self.result = None;
+                self.sort = None;
                 self.screen = Screen::Browse;
                 self.browse_focus = BrowseFocus::Containers;
                 self.status = String::new();
                 self.load_rows();
             }
-            Done::Rows(res, focus_rows) => {
+            Done::Rows(res, focus_rows, total) => {
                 self.row_idx = 0;
-                self.status = format!("{} rows (offset {})", res.rows.len(), self.offset);
+                self.total = total;
+                self.status = self.rows_status(res.rows.len());
                 self.result = Some(res);
                 if focus_rows {
                     self.browse_focus = BrowseFocus::Rows;
@@ -640,6 +649,13 @@ impl App {
         }
         if self.screen == Screen::Browse {
             out.extend(self.containers.iter().cloned());
+            if let Some(res) = &self.result {
+                out.push("sort".into());
+                for c in &res.columns {
+                    out.push(format!("sort {c}"));
+                    out.push(format!("sort {c} desc"));
+                }
+            }
         }
         out.extend(
             crate::theme::names()
@@ -711,6 +727,10 @@ impl App {
     }
 
     async fn run_command(&mut self, cmd: &str) {
+        if cmd == "sort" || cmd.starts_with("sort ") {
+            self.sort_command(&cmd[4..]);
+            return;
+        }
         if cmd == "theme" {
             self.status = format!(
                 "theme: {} (available: {})",
@@ -742,6 +762,7 @@ impl App {
                     self.container_idx = i;
                     self.browse_focus = BrowseFocus::Containers;
                     self.offset = 0;
+                    self.sort = None;
                     self.fetch_rows(true);
                 } else if let Some(i) = (self.screen != Screen::Connections)
                     .then(|| find(&self.databases))
@@ -768,7 +789,9 @@ impl App {
     // shortcut: one fetch per keypress, no debounce; add one if holding j/k on many tables gets slow
     fn preview_container(&mut self) {
         if self.screen == Screen::Browse && self.browse_focus == BrowseFocus::Containers {
+            // another container, other columns: its own natural order
             self.offset = 0;
+            self.sort = None;
             self.load_rows();
         }
     }
@@ -833,6 +856,8 @@ impl App {
                     self.container_idx = 0;
                     self.result = None;
                     self.offset = 0;
+                    self.sort = None;
+                    self.total = None;
                     self.row_idx = 0;
                     self.screen = Screen::Databases;
                 }
@@ -887,12 +912,81 @@ impl App {
             Some(c) => c.to_string(),
             None => return,
         };
-        let offset = self.offset;
+        let (offset, sort) = (self.offset, self.sort.clone());
         self.start("loading rows...", false, move |s| async move {
-            s.fetch_rows(&db, &container, PAGE_SIZE, offset)
-                .await
-                .map(|r| Done::Rows(r, focus_rows))
+            let res = match &sort {
+                Some(o) => {
+                    s.fetch_sorted(&db, &container, PAGE_SIZE, offset, o)
+                        .await?
+                }
+                None => s.fetch_rows(&db, &container, PAGE_SIZE, offset).await?,
+            };
+            // a failed count only hides paging, it doesn't fail the page
+            let total = s.count_rows(&db, &container).await.ok().flatten();
+            Ok(Done::Rows(res, focus_rows, total))
         });
+    }
+
+    /// `200 rows (offset 0)`, plus `of 1234, page 1/7` and the sort when known.
+    fn rows_status(&self, shown: usize) -> String {
+        let mut s = format!("{shown} rows (offset {})", self.offset);
+        if let Some(total) = self.total {
+            let pages = total.div_ceil(PAGE_SIZE as u64).max(1);
+            let page = self.offset as u64 / PAGE_SIZE as u64 + 1;
+            s += &format!(" of {total}, page {page}/{pages}");
+        }
+        if let Some(o) = &self.sort {
+            s += &format!(
+                ", sorted by {} {}",
+                o.column,
+                if o.desc { "↓" } else { "↑" }
+            );
+        }
+        s
+    }
+
+    /// Reorders the rows pane server-side and reloads it from the first page; None
+    /// back to the natural order. Used by `:sort` and the GUI's header clicks.
+    pub fn set_sort(&mut self, sort: Option<Sort>) {
+        if self.screen != Screen::Browse || self.result.is_none() {
+            self.status = "error: open a table first".into();
+            return;
+        }
+        if sort.is_some() && !self.current_source().is_some_and(|s| s.can_sort()) {
+            self.status = "error: this backend can't sort".into();
+            return;
+        }
+        self.sort = sort;
+        self.offset = 0;
+        self.load_rows();
+    }
+
+    /// `:sort`, `:sort <column>`, `:sort <column> desc`.
+    fn sort_command(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        let Some(column) = words.next() else {
+            return self.set_sort(None);
+        };
+        let desc = match words.next() {
+            None | Some("asc") => false,
+            Some("desc") => true,
+            Some(other) => {
+                self.status = format!("error: sort direction '{other}' is not asc or desc");
+                return;
+            }
+        };
+        let known = self
+            .result
+            .as_ref()
+            .is_some_and(|r| r.columns.iter().any(|c| c == column));
+        if !known {
+            self.status = format!("error: no column '{column}' here");
+            return;
+        }
+        self.set_sort(Some(Sort {
+            column: column.to_string(),
+            desc,
+        }));
     }
 
     async fn handle_query_key(&mut self, key: KeyEvent) {
@@ -1326,6 +1420,12 @@ mod tests {
         async fn run_query(&self, _: &str, _: &str, _: &str) -> Result<QueryResult> {
             unimplemented!()
         }
+        fn can_sort(&self) -> bool {
+            true
+        }
+        async fn count_rows(&self, _: &str, _: &str) -> Result<Option<u64>> {
+            Ok(Some(450))
+        }
         async fn delete_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
             tokio::time::sleep(self.delay).await;
             self.deleted.store(true, Ordering::SeqCst);
@@ -1409,7 +1509,45 @@ mod tests {
         assert!(app.is_busy());
         settle(&mut app).await;
         assert!(deleted.load(Ordering::SeqCst));
-        assert_eq!(app.status, "1 rows (offset 0)");
+        assert_eq!(app.status, "1 rows (offset 0) of 450, page 1/3");
+    }
+
+    async fn command(app: &mut App, text: &str) {
+        press(app, KeyCode::Char(':')).await;
+        for c in text.chars() {
+            press(app, KeyCode::Char(c)).await;
+        }
+        press(app, KeyCode::Enter).await;
+        settle(app).await;
+    }
+
+    #[tokio::test]
+    async fn sort_command_orders_rows_server_side() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        press(&mut app, KeyCode::Char(':')).await;
+        press(&mut app, KeyCode::Char('s')).await;
+        assert!(app.command_matches().contains(&"sort id desc".to_string()));
+        press(&mut app, KeyCode::Esc).await;
+
+        command(&mut app, "sort id desc").await;
+        assert_eq!(
+            app.sort.as_ref().map(|s| (s.column.as_str(), s.desc)),
+            Some(("id", true))
+        );
+        assert_eq!(
+            app.status,
+            "1 rows (offset 0) of 450, page 1/3, sorted by id ↓"
+        );
+        command(&mut app, "sort nope").await;
+        assert_eq!(app.status, "error: no column 'nope' here");
+        command(&mut app, "sort id sideways").await;
+        assert!(app.status.contains("not asc or desc"));
+        command(&mut app, "sort").await;
+        assert_eq!(app.sort, None);
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 use super::{
     amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
-    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource, QueryResult, ReadOnly,
+    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource, QueryResult, ReadOnly, Sort,
 };
 use crate::value::Row;
 use anyhow::Result;
@@ -45,6 +45,19 @@ async fn exercise(source: &dyn DataSource, db: &str, container: &str, query_for_
     assert!(res.columns.iter().any(|c| c == "name"));
     let paged = source.fetch_rows(db, container, 1, 1).await.unwrap();
     assert_eq!(paged.rows.len(), 1);
+
+    assert!(source.can_sort());
+    let by_name_desc = Sort {
+        column: "name".into(),
+        desc: true,
+    };
+    let sorted = source
+        .fetch_sorted(db, container, 10, 0, &by_name_desc)
+        .await
+        .unwrap();
+    let names: Vec<_> = sorted.rows.iter().map(|r| r["name"].clone()).collect();
+    assert_eq!(names, [json!("b"), json!("a")]);
+    assert_eq!(source.count_rows(db, container).await.unwrap(), Some(2));
 
     let row_a = res.rows.iter().find(|r| r["name"] == json!("a")).unwrap();
     let mut edited = row_a.clone();

@@ -1,5 +1,6 @@
 //! Desktop frontend: the same `App`, screens and keys as the TUI, drawn with GPUI.
 use db9s_core::app::{AddField, App, BrowseFocus, FieldEdit, Mode, Screen};
+use db9s_core::datasource::Sort;
 use db9s_core::input::Input;
 use db9s_core::key::{KeyCode, KeyEvent};
 use db9s_core::theme::{self, BorderType, Color};
@@ -535,7 +536,18 @@ impl Db9s {
             .border_color(p.border_blur)
             .children(res.columns.iter().zip(&widths).map(|(col, w)| {
                 let (col_name, w) = (col.clone(), *w);
+                let arrow = match &app.sort {
+                    Some(s) if &s.column == col => {
+                        if s.desc {
+                            " ↓"
+                        } else {
+                            " ↑"
+                        }
+                    }
+                    _ => "",
+                };
                 div()
+                    .id(SharedString::from(format!("head-{col}")))
                     .relative()
                     .flex_shrink_0()
                     .w(px(w))
@@ -543,7 +555,28 @@ impl Db9s {
                     .truncate()
                     .text_color(p.field_name)
                     .font_weight(gpui::FontWeight::BOLD)
-                    .child(col.clone())
+                    .cursor_pointer()
+                    .debug_selector(|| format!("head-{col}"))
+                    // click: ascending, again: descending, again: natural order
+                    .on_click(cx.listener({
+                        let col = col.clone();
+                        move |this, _, _, cx| {
+                            let next = match &this.app.sort {
+                                Some(s) if s.column == col && s.desc => None,
+                                Some(s) if s.column == col => Some(Sort {
+                                    column: col.clone(),
+                                    desc: true,
+                                }),
+                                _ => Some(Sort {
+                                    column: col.clone(),
+                                    desc: false,
+                                }),
+                            };
+                            this.app.set_sort(next);
+                            cx.notify();
+                        }
+                    }))
+                    .child(format!("{col}{arrow}"))
                     .child(
                         // drag handle on the right edge
                         div()
@@ -1380,6 +1413,30 @@ mod tests {
             v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Enter)));
             let fe = v.app.field_edit.as_ref().unwrap();
             assert_eq!(fe.edited["name"], "MouseX");
+        });
+    }
+
+    /// Clicking a grid header asks the core to sort by that column (the sorting itself
+    /// is tested in the core; here, no connection: the core refuses, proving the click).
+    #[gpui::test]
+    fn clicking_a_header_sorts(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["id".into()],
+            rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        cx.run_until_parked();
+        let head = cx.debug_bounds("head-id").expect("header is rendered");
+        cx.simulate_click(head.center(), Default::default());
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.app.status, "error: this backend can't sort")
         });
     }
 

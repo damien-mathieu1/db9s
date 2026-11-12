@@ -19,6 +19,13 @@ pub struct QueryResult {
     pub affected: Option<u64>,
 }
 
+/// Server-side order for a page of rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sort {
+    pub column: String,
+    pub desc: bool,
+}
+
 /// Uniform interface over a database backend, browsable k9s-style:
 /// database -> container (table/collection) -> rows/documents.
 #[async_trait]
@@ -46,6 +53,28 @@ pub trait DataSource: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<QueryResult>;
+
+    /// Whether `fetch_sorted` really sorts; queues and key stores have no column order.
+    fn can_sort(&self) -> bool {
+        false
+    }
+
+    /// `fetch_rows` ordered by `sort`; backends that can't sort return the plain page.
+    async fn fetch_sorted(
+        &self,
+        database: &str,
+        container: &str,
+        limit: i64,
+        offset: i64,
+        _sort: &Sort,
+    ) -> Result<QueryResult> {
+        self.fetch_rows(database, container, limit, offset).await
+    }
+
+    /// Rows in the container, when the backend can count them cheaply; None hides paging.
+    async fn count_rows(&self, _database: &str, _container: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
 
     /// Raw query: SQL for postgres, a mongo shell-ish JSON filter `{"find": ...}` not required —
     /// for mongo this runs an aggregation pipeline given as a JSON array string, or a plain
@@ -93,6 +122,27 @@ impl DataSource for ReadOnly {
         offset: i64,
     ) -> Result<QueryResult> {
         self.0.fetch_rows(database, container, limit, offset).await
+    }
+
+    fn can_sort(&self) -> bool {
+        self.0.can_sort()
+    }
+
+    async fn fetch_sorted(
+        &self,
+        database: &str,
+        container: &str,
+        limit: i64,
+        offset: i64,
+        sort: &Sort,
+    ) -> Result<QueryResult> {
+        self.0
+            .fetch_sorted(database, container, limit, offset, sort)
+            .await
+    }
+
+    async fn count_rows(&self, database: &str, container: &str) -> Result<Option<u64>> {
+        self.0.count_rows(database, container).await
     }
 
     async fn run_query(&self, database: &str, container: &str, raw: &str) -> Result<QueryResult> {
