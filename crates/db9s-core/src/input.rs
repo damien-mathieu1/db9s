@@ -66,6 +66,13 @@ impl Input {
         true
     }
 
+    /// Inserts `text` at the cursor and moves past it (completions, pastes).
+    pub fn insert_str(&mut self, text: &str) {
+        let b = self.byte_at(self.cursor);
+        self.value.insert_str(b, text);
+        self.cursor += text.chars().count();
+    }
+
     /// The text before the cursor, the char under it (None at the end), and the rest,
     /// so a frontend can draw the cursor however it likes.
     pub fn split_at_cursor(&self) -> (&str, Option<char>, &str) {
@@ -108,5 +115,8 @@ mod tests {
         press(&mut i, KeyCode::Left);
         assert_eq!(i.split_at_cursor(), ("él", Some('o'), "!"));
         assert_eq!(i.value(), "élo!");
+        i.insert_str("ab");
+        assert_eq!(i.value(), "élabo!");
+        assert_eq!(i.split_at_cursor(), ("élab", Some('o'), "!"));
     }
 }

@@ -2,6 +2,7 @@
 mod state;
 
 use db9s_core::app::{AddField, App, BrowseFocus, FieldEdit, Mode, Screen};
+use db9s_core::config::Kind;
 use db9s_core::datasource::Sort;
 use db9s_core::input::Input;
 use db9s_core::key::{KeyCode, KeyEvent};
@@ -183,6 +184,19 @@ impl Db9s {
             cx.notify();
             return;
         }
+        if matches!(self.app.mode, Mode::Query) {
+            match k.key.as_str() {
+                "enter" if k.modifiers.shift => {
+                    self.app.query_input.insert_str("\n");
+                    return cx.notify();
+                }
+                "tab" if !k.modifiers.shift => {
+                    self.complete_query();
+                    return cx.notify();
+                }
+                _ => {}
+            }
+        }
         let Some(key) = to_core_key(k) else {
             return;
         };
@@ -279,6 +293,33 @@ impl Db9s {
                     .unwrap_or_default()
             ),
         }
+    }
+
+    /// Tab in the query editor: completes the word before the cursor from the tables
+    /// and columns on screen, and SQL keywords.
+    fn complete_query(&mut self) {
+        let (before, _, _) = self.app.query_input.split_at_cursor();
+        let mut word: Vec<char> = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        word.reverse();
+        let word: String = word.into_iter().collect();
+        let mut names: Vec<String> = self.app.containers.clone();
+        if let Some(res) = &self.app.result {
+            names.extend(res.columns.iter().cloned());
+        }
+        names.extend(SQL_KEYWORDS.iter().map(|k| k.to_string()));
+        let Some(best) = db9s_core::app::complete(&names, &word).into_iter().next() else {
+            return;
+        };
+        let rest: String = best.chars().skip(word.chars().count()).collect();
+        // keywords follow the case being typed: `sel` -> `select`
+        let lower = SQL_KEYWORDS.contains(&best.as_str()) && !word.chars().any(char::is_uppercase);
+        self.app
+            .query_input
+            .insert_str(&if lower { rest.to_lowercase() } else { rest });
     }
 
     fn save_state(&self) {
@@ -818,7 +859,11 @@ impl Render for Db9s {
                 .into_any_element(),
             Screen::Browse => self.browse(&p, cx).into_any_element(),
         };
-        root = root.child(body).child(footer(app, &p));
+        root = root.child(body);
+        if matches!(app.mode, Mode::Query) {
+            root = root.child(query_editor(app, &p));
+        }
+        root = root.child(footer(app, &p));
         if let Some(modal) = modal(app, &p) {
             root = root.child(
                 div()
@@ -1250,6 +1295,178 @@ impl Db9s {
     }
 }
 
+const SQL_KEYWORDS: [&str; 52] = [
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "NULL",
+    "IS",
+    "IN",
+    "LIKE",
+    "ILIKE",
+    "ORDER",
+    "BY",
+    "GROUP",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "FULL",
+    "ON",
+    "AS",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "DISTINCT",
+    "COUNT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "ASC",
+    "DESC",
+    "WITH",
+    "UNION",
+    "ALL",
+    "EXISTS",
+    "BETWEEN",
+    "CREATE",
+    "TABLE",
+    "DROP",
+    "ALTER",
+    "RETURNING",
+    "EXPLAIN",
+    "SHOW",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tok {
+    Plain,
+    Keyword,
+    Str,
+    Num,
+    /// true / false / null
+    Lit,
+}
+
+/// Splits a query into colored runs: strings, numbers, true/false/null, and (for SQL)
+/// keywords. Good enough to read a query at a glance, not a parser.
+fn tokenize(text: &str, sql: bool) -> Vec<(String, Tok)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(String, Tok)> = vec![];
+    let mut push = |s: String, t: Tok| match out.last_mut() {
+        Some((last, Tok::Plain)) if t == Tok::Plain => last.push_str(&s),
+        _ => out.push((s, t)),
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let start = i;
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                i += 1;
+            }
+            i = (i + 1).min(chars.len());
+            push(chars[start..i].iter().collect(), Tok::Str);
+        } else if c.is_ascii_digit() {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+                i += 1;
+            }
+            push(chars[start..i].iter().collect(), Tok::Num);
+        } else if c.is_alphabetic() || c == '_' {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let upper = word.to_uppercase();
+            let tok = if ["TRUE", "FALSE", "NULL"].contains(&upper.as_str()) {
+                Tok::Lit
+            } else if sql && SQL_KEYWORDS.contains(&upper.as_str()) {
+                Tok::Keyword
+            } else {
+                Tok::Plain
+            };
+            push(word, tok);
+        } else {
+            i += 1;
+            push(c.to_string(), Tok::Plain);
+        }
+    }
+    out
+}
+
+fn highlight(text: &str, sql: bool, p: &Palette) -> Vec<Span> {
+    tokenize(text, sql)
+        .into_iter()
+        .map(|(t, tok)| match tok {
+            Tok::Plain => raw(t),
+            Tok::Keyword => styled(t, p.border_focus).bold(),
+            Tok::Str => styled(t, p.success),
+            Tok::Num => styled(t, p.key_hint),
+            Tok::Lit => styled(t, p.muted),
+        })
+        .collect()
+}
+
+/// The `/` prompt as a multi-line, highlighted editor with the cursor drawn in.
+fn query_editor(app: &App, p: &Palette) -> Div {
+    let sql = !matches!(
+        app.conns.get(app.conn_idx).map(|c| c.kind),
+        Some(Kind::Mongo | Kind::Redis | Kind::RabbitMq)
+    );
+    let (before, at, after) = app.query_input.split_at_cursor();
+    let (cur_line, col) = match before.rsplit_once('\n') {
+        Some((head, tail)) => (head.matches('\n').count() + 1, tail),
+        None => (0, before),
+    };
+    let text = format!(
+        "{before}{}{after}",
+        at.map(String::from).unwrap_or_default()
+    );
+    let cursor = Span {
+        fg: Some(rgb(BG).into()),
+        bg: Some(rgb(FG).into()),
+        // at a line end the char under the cursor is the newline itself
+        ..raw(at
+            .filter(|c| *c != '\n')
+            .map_or(" ".to_string(), String::from))
+    };
+    let lines = text.split('\n').enumerate().map(|(i, l)| {
+        if i != cur_line {
+            return line(highlight(l, sql, p));
+        }
+        let col_chars = col.chars().count();
+        let head: String = l.chars().take(col_chars).collect();
+        let skip = col_chars + usize::from(at.is_some_and(|c| c != '\n'));
+        let tail: String = l.chars().skip(skip).collect();
+        let mut spans = highlight(&head, sql, p);
+        spans.push(cursor.clone());
+        spans.extend(highlight(&tail, sql, p));
+        line(spans)
+    });
+    let title = if app.is_queue() { "publish" } else { "query" };
+    pane(
+        format!(
+            "{title}  (shift+enter new line, tab complete, ↑/↓ history, enter run, esc cancel)"
+        ),
+        p.border_focus,
+        p,
+    )
+    .children(lines)
+}
+
 /// One line of the inspector tree.
 #[derive(Debug, PartialEq)]
 struct TreeLine {
@@ -1454,14 +1671,10 @@ fn field_editor(fe: &FieldEdit, p: &Palette) -> Div {
 
 fn footer(app: &App, p: &Palette) -> Div {
     if matches!(app.mode, Mode::Query) {
-        let prompt = if app.is_queue() {
-            "publish> "
-        } else {
-            "query> "
-        };
-        let mut spans = vec![raw(prompt)];
-        spans.extend(input_spans(&app.query_input, true));
-        return line(spans).text_color(p.selected_fg);
+        return line(help_spans(
+            "enter run  shift+enter new_line  tab complete  ↑/↓ history  esc cancel",
+            p,
+        ));
     }
     if matches!(
         app.mode,
@@ -2012,6 +2225,67 @@ mod tests {
         );
         cx.simulate_keystrokes("cmd-w");
         assert_eq!(state(cx), (1, 0, None));
+    }
+
+    #[test]
+    fn tokenizes_queries() {
+        let marked: Vec<(String, Tok)> = tokenize(
+            "select * from t where n = 'it''s' and x > 4.5 or y is null",
+            true,
+        )
+        .into_iter()
+        .filter(|(_, t)| *t != Tok::Plain)
+        .collect();
+        let expect: Vec<(String, Tok)> = [
+            ("select", Tok::Keyword),
+            ("from", Tok::Keyword),
+            ("where", Tok::Keyword),
+            ("'it'", Tok::Str),
+            ("'s'", Tok::Str),
+            ("and", Tok::Keyword),
+            ("4.5", Tok::Num),
+            ("or", Tok::Keyword),
+            ("is", Tok::Keyword),
+            ("null", Tok::Lit),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.to_string(), t))
+        .collect();
+        assert_eq!(marked, expect);
+        // mongo: no keywords, JSON strings and literals still
+        let mongo = tokenize(r#"{"name": "select", "n": 1, "ok": true}"#, false);
+        assert!(mongo.iter().all(|(_, t)| *t != Tok::Keyword));
+        assert!(mongo.contains(&("true".into(), Tok::Lit)));
+        // plain runs merge: one span per gap, not per char
+        assert_eq!(tokenize("a  +  b", true).len(), 1);
+    }
+
+    /// Shift+enter adds a line, tab completes a table, a column and keywords.
+    #[gpui::test]
+    fn query_editor_multiline_and_completion(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Query;
+        app.containers = vec!["products".into()];
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["price".into()],
+            rows: vec![],
+            affected: None,
+        });
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
+        cx.update(|window, cx| window.focus(&view.read(cx).focus));
+        cx.simulate_keystrokes("s e l tab space * space f r o m space p r o tab");
+        cx.simulate_keystrokes("shift-enter w h e r tab space p r i tab");
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.app.query_input.value(),
+                "select * from products\nwhere price"
+            );
+        });
+        cx.run_until_parked();
     }
 
     #[test]
