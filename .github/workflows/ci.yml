@@ -69,7 +69,7 @@ jobs:
   # GPUI is out of default-members (slow, system libs on Linux); macOS builds it
   # with no extra setup thanks to runtime_shaders.
   gui:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
