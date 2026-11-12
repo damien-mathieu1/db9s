@@ -1,10 +1,9 @@
 use crate::config::{Config, Kind};
 use crate::datasource::{DataSource, QueryResult, ReadOnly};
 use crate::input::Input;
+use crate::key::{KeyCode, KeyEvent};
 use crate::value::Row;
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::widgets::ListState;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -115,11 +114,6 @@ pub struct App {
     pub db_idx: usize,
     pub container_idx: usize,
     pub row_idx: usize,
-
-    pub conn_list: ListState,
-    pub db_list: ListState,
-    pub container_list: ListState,
-    pub field_list: ListState,
 
     pub screen: Screen,
     pub browse_focus: BrowseFocus,
@@ -258,10 +252,6 @@ impl App {
             db_idx: 0,
             container_idx: 0,
             row_idx: 0,
-            conn_list: ListState::default(),
-            db_list: ListState::default(),
-            container_list: ListState::default(),
-            field_list: ListState::default(),
             screen: Screen::Connections,
             browse_focus: BrowseFocus::Containers,
             mode,
@@ -406,7 +396,7 @@ impl App {
 
     async fn handle_normal_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') if key.ctrl => {
                 self.should_quit = true;
             }
             KeyCode::Char('q') => match self.screen {
@@ -889,7 +879,7 @@ impl App {
             KeyCode::Enter => {
                 fe.input = Some(Input::new(crate::value::value_to_input(&fe.edited[&field])))
             }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('s') if key.ctrl => {
                 let fe = self.field_edit.take().unwrap();
                 self.mode = Mode::Normal;
                 if fe.edited == fe.original {
@@ -1112,9 +1102,7 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
             }
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_test_conn()
-            }
+            KeyCode::Char('t') if key.ctrl => self.start_test_conn(),
             KeyCode::Tab | KeyCode::Down => {
                 self.new_conn_field = match self.new_conn_field {
                     AddField::Name => AddField::Url,

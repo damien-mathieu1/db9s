@@ -22,10 +22,10 @@ DB9S_TEST_MYSQL_URL=mysql://db9s:db9s@localhost:53306/db9s \
 DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
 DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
-DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
+DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test --workspace
 ```
 
-`src/datasource/tests.rs` runs the same scenario (list, page, update, query,
+`crates/db9s-core/src/datasource/tests.rs` runs the same scenario (list, page, update, query,
 delete) against every database backend, and `exercise_queue()` runs the broker
 scenario (publish, peek, purge) against every queue backend (RabbitMQ over the
 management API and over AMQP). Redis has its own test, one check per key type. A backend without
@@ -35,15 +35,15 @@ Keep the diff focused on one change. No unused code, no new warnings.
 
 ## Adding a backend
 
-1. SQL databases: implement `SqlDialect` (`src/datasource/sql.rs`), see
+1. SQL databases: implement `SqlDialect` (`crates/db9s-core/src/datasource/sql.rs`), see
    `postgres.rs` / `mysql.rs`. The generic `SqlSource` engine does listing,
    paging, raw queries and primary-key edit/delete. Anything else: implement
-   the `DataSource` trait (`src/datasource/mod.rs`) in a new module under
-   `src/datasource/`. Message brokers (Kafka, NATS, ...) return `true`
+   the `DataSource` trait (`crates/db9s-core/src/datasource/mod.rs`) in a new module under
+   `crates/db9s-core/src/datasource/`. Message brokers (Kafka, NATS, ...) return `true`
    from `is_queue()`: the UI then shows publish/purge and disables edit.
    Implement `is_read_query()` too, or read-only connections refuse every raw query.
-2. Add a variant to `Kind` in `src/config.rs` (and to `Kind::ALL` / `label()`),
-   then an arm in `connect()` in `src/app.rs`. The add-connection form, config
+2. Add a variant to `Kind` in `crates/db9s-core/src/config.rs` (and to `Kind::ALL` / `label()`),
+   then an arm in `connect()` in `crates/db9s-core/src/app.rs`. The add-connection form, config
    file and footer hints pick it up from there.
 3. Add a `<backend>_conformance` test calling `exercise()` (databases) or
    `exercise_queue()` (brokers), a seed in `dev/`, and a service in
@@ -75,5 +75,5 @@ the seeded `docker compose` stack:
 docker compose up -d && cargo build && vhs docs/demo.tape && vhs docs/screenshots.tape && vhs docs/themes.tape
 ```
 
-A new built-in theme is a TOML file in `src/themes/` plus a line in `BUILTIN`
-(`src/theme.rs`); add it to `docs/themes.tape` and the README gallery.
+A new built-in theme is a TOML file in `crates/db9s-core/src/themes/` plus a line in `BUILTIN`
+(`crates/db9s-core/src/theme.rs`); add it to `docs/themes.tape` and the README gallery.

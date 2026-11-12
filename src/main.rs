@@ -1,20 +1,15 @@
-mod app;
-mod config;
-mod datasource;
-mod input;
-mod secrets;
-mod theme;
 mod ui;
-mod value;
 
 use anyhow::Result;
-use app::App;
 use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use db9s_core::app::{self, App};
+use db9s_core::config;
+use db9s_core::key::{KeyCode, KeyEvent};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::time::Duration;
 
@@ -103,7 +98,8 @@ async fn run(mut app: App) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, &mut app).await;
+    let mut lists = ui::Lists::default();
+    let result = event_loop(&mut terminal, &mut app, &mut lists).await;
 
     disable_raw_mode()?;
     execute!(
@@ -119,15 +115,16 @@ async fn run(mut app: App) -> Result<()> {
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
+    lists: &mut ui::Lists,
 ) -> Result<()> {
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        terminal.draw(|f| ui::draw(f, app, lists))?;
         app.poll_connecting().await;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
-                    app.handle_key(key).await;
+                    app.handle_key(to_core_key(key)).await;
                 }
             }
         }
@@ -139,6 +136,30 @@ async fn event_loop(
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+fn to_core_key(key: event::KeyEvent) -> KeyEvent {
+    use event::KeyCode as K;
+    let code = match key.code {
+        K::Char(c) => KeyCode::Char(c),
+        K::Enter => KeyCode::Enter,
+        K::Esc => KeyCode::Esc,
+        K::Tab => KeyCode::Tab,
+        K::BackTab => KeyCode::BackTab,
+        K::Backspace => KeyCode::Backspace,
+        K::Delete => KeyCode::Delete,
+        K::Left => KeyCode::Left,
+        K::Right => KeyCode::Right,
+        K::Up => KeyCode::Up,
+        K::Down => KeyCode::Down,
+        K::Home => KeyCode::Home,
+        K::End => KeyCode::End,
+        _ => KeyCode::Other,
+    };
+    KeyEvent {
+        code,
+        ctrl: key.modifiers.contains(event::KeyModifiers::CONTROL),
     }
 }
 

@@ -917,16 +917,26 @@ name = "db9s"
 version = "2026.11.3"
 dependencies = [
  "anyhow",
+ "clap",
+ "crossterm",
+ "db9s-core",
+ "ratatui",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "db9s-core"
+version = "2026.11.3"
+dependencies = [
+ "anyhow",
  "async-trait",
  "bson",
  "chrono",
- "clap",
- "crossterm",
  "directories",
  "futures-util",
  "lapin",
  "mongodb",
- "ratatui",
  "redis",
  "reqwest",
  "serde",

@@ -1,14 +1,102 @@
-use crate::app::{App, BrowseFocus, Mode, Screen};
-use crate::theme;
+use db9s_core::app::{App, BrowseFocus, Mode, Screen};
+use db9s_core::input::Input;
+use db9s_core::theme::{self as core_theme, BorderType as CoreBorder, Color as CoreColor};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+/// Scroll state of each list; TUI-only, since the core app only tracks selection.
+#[derive(Default)]
+pub struct Lists {
+    conn: ListState,
+    db: ListState,
+    container: ListState,
+    field: ListState,
+}
+
+/// The core theme in ratatui types.
+struct Theme {
+    border_focus: Color,
+    border_blur: Color,
+    selected_fg: Color,
+    selected_bg: Color,
+    field_name: Color,
+    modal_border: Color,
+    error: Color,
+    success: Color,
+    key_hint: Color,
+    muted: Color,
+    border_type: BorderType,
+}
+
+/// The active core theme, converted to ratatui types.
+fn theme() -> Theme {
+    let t = core_theme::get();
+    Theme {
+        border_focus: color(t.border_focus),
+        border_blur: color(t.border_blur),
+        selected_fg: color(t.selected_fg),
+        selected_bg: color(t.selected_bg),
+        field_name: color(t.field_name),
+        modal_border: color(t.modal_border),
+        error: color(t.error),
+        success: color(t.success),
+        key_hint: color(t.key_hint),
+        muted: color(t.muted),
+        border_type: match t.border_type {
+            CoreBorder::Plain => BorderType::Plain,
+            CoreBorder::Rounded => BorderType::Rounded,
+            CoreBorder::Double => BorderType::Double,
+            CoreBorder::Thick => BorderType::Thick,
+        },
+    }
+}
+
+fn color(c: CoreColor) -> Color {
+    match c {
+        CoreColor::Reset => Color::Reset,
+        CoreColor::Black => Color::Black,
+        CoreColor::Red => Color::Red,
+        CoreColor::Green => Color::Green,
+        CoreColor::Yellow => Color::Yellow,
+        CoreColor::Blue => Color::Blue,
+        CoreColor::Magenta => Color::Magenta,
+        CoreColor::Cyan => Color::Cyan,
+        CoreColor::Gray => Color::Gray,
+        CoreColor::DarkGray => Color::DarkGray,
+        CoreColor::LightRed => Color::LightRed,
+        CoreColor::LightGreen => Color::LightGreen,
+        CoreColor::LightYellow => Color::LightYellow,
+        CoreColor::LightBlue => Color::LightBlue,
+        CoreColor::LightMagenta => Color::LightMagenta,
+        CoreColor::LightCyan => Color::LightCyan,
+        CoreColor::White => Color::White,
+        CoreColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        CoreColor::Indexed(i) => Color::Indexed(i),
+    }
+}
+
+/// The text, with the cursor drawn as a reversed cell when focused.
+fn input_spans(input: &Input, focused: bool) -> Vec<Span<'static>> {
+    if !focused {
+        return vec![Span::raw(input.value().to_string())];
+    }
+    let (before, at, after) = input.split_at_cursor();
+    vec![
+        Span::raw(before.to_string()),
+        Span::styled(
+            at.map_or(" ".to_string(), String::from),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(after.to_string()),
+    ]
+}
+
+pub fn draw(f: &mut Frame, app: &App, lists: &mut Lists) {
     let prompt = matches!(app.mode, Mode::Command);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -26,17 +114,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     let body = chunks[2];
     match app.screen {
-        Screen::Connections => draw_connections(f, body, app),
+        Screen::Connections => draw_connections(f, body, app, &mut lists.conn),
         Screen::Databases => draw_list(
             f,
             body,
             "databases",
             &app.databases,
             app.db_idx,
-            &mut app.db_list,
+            &mut lists.db,
             true,
         ),
-        Screen::Browse => draw_browse(f, body, app),
+        Screen::Browse => draw_browse(f, body, app, lists),
     }
     draw_footer(f, app, chunks[3]);
 
@@ -86,7 +174,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::styled(
         format!(" db9s :: {path} "),
         Style::default()
-            .fg(theme::get().border_focus)
+            .fg(theme().border_focus)
             .add_modifier(Modifier::BOLD),
     )];
     if app.is_read_only() {
@@ -95,8 +183,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let title = Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::get().border_type)
-            .border_style(Style::default().fg(theme::get().border_blur)),
+            .border_type(theme().border_type)
+            .border_style(Style::default().fg(theme().border_blur)),
     );
     f.render_widget(title, area);
 }
@@ -106,7 +194,7 @@ fn read_only_badge() -> Span<'static> {
     Span::styled(
         "READ-ONLY ",
         Style::default()
-            .fg(theme::get().error)
+            .fg(theme().error)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -115,7 +203,7 @@ fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(
         "> ",
         Style::default()
-            .fg(theme::get().border_focus)
+            .fg(theme().border_focus)
             .add_modifier(Modifier::BOLD),
     )];
     match app.command_suggestion().filter(|s| !s.is_empty()) {
@@ -126,21 +214,21 @@ fn draw_command_prompt(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(
                 first,
                 Style::default()
-                    .fg(theme::get().muted)
+                    .fg(theme().muted)
                     .add_modifier(Modifier::REVERSED),
             ));
             spans.push(Span::styled(
                 chars.as_str().to_string(),
-                Style::default().fg(theme::get().muted),
+                Style::default().fg(theme().muted),
             ));
         }
-        None => spans.extend(app.command_input.spans(true)),
+        None => spans.extend(input_spans(&app.command_input, true)),
     }
     f.render_widget(
         Paragraph::new(Line::from(spans)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::get().border_type)
+                .border_type(theme().border_type)
                 .border_style(pane_border(true))
                 .title("command"),
         ),
@@ -157,25 +245,25 @@ fn conn_name(app: &App) -> String {
 
 fn selected_style() -> Style {
     Style::default()
-        .fg(theme::get().selected_fg)
-        .bg(theme::get().selected_bg)
+        .fg(theme().selected_fg)
+        .bg(theme().selected_bg)
 }
 
 fn pane_border(focused: bool) -> Style {
     Style::default().fg(if focused {
-        theme::get().border_focus
+        theme().border_focus
     } else {
-        theme::get().border_blur
+        theme().border_blur
     })
 }
 
-fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_connections(f: &mut Frame, area: Rect, app: &App, state: &mut ListState) {
     let items: Vec<ListItem> = app
         .conns
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let masked = crate::app::mask_password(&c.url);
+            let masked = db9s_core::app::mask_password(&c.url);
             let status = match &c.source {
                 Ok(_) => String::new(),
                 Err(e) => format!("  (error: {e})"),
@@ -187,15 +275,15 @@ fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
                 ),
                 Span::styled(
                     format!("[{}]  ", c.kind.label()),
-                    Style::default().fg(theme::get().field_name),
+                    Style::default().fg(theme().field_name),
                 ),
                 if c.read_only || app.force_read_only {
                     read_only_badge()
                 } else {
                     Span::raw("")
                 },
-                Span::styled(masked, Style::default().fg(theme::get().muted)),
-                Span::styled(status, Style::default().fg(theme::get().error)),
+                Span::styled(masked, Style::default().fg(theme().muted)),
+                Span::styled(status, Style::default().fg(theme().error)),
             ]);
             let style = if i == app.conn_idx {
                 selected_style()
@@ -208,13 +296,12 @@ fn draw_connections(f: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::get().border_type)
+            .border_type(theme().border_type)
             .border_style(pane_border(true))
             .title("connections  (a add, e edit, d delete, s settings)"),
     );
-    app.conn_list
-        .select((!app.conns.is_empty()).then_some(app.conn_idx));
-    f.render_stateful_widget(list, area, &mut app.conn_list);
+    state.select((!app.conns.is_empty()).then_some(app.conn_idx));
+    f.render_stateful_widget(list, area, state);
 }
 
 fn draw_list(
@@ -241,7 +328,7 @@ fn draw_list(
     let list = List::new(list_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::get().border_type)
+            .border_type(theme().border_type)
             .border_style(pane_border(focused))
             .title(title),
     );
@@ -249,7 +336,7 @@ fn draw_list(
     f.render_stateful_widget(list, area, state);
 }
 
-fn draw_browse(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_browse(f: &mut Frame, area: Rect, app: &App, lists: &mut Lists) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
@@ -262,17 +349,22 @@ fn draw_browse(f: &mut Frame, area: Rect, app: &mut App) {
         "containers  (enter open)",
         &app.containers,
         app.container_idx,
-        &mut app.container_list,
+        &mut lists.container,
         containers_focused,
     );
     match &app.field_edit {
-        Some(fe) => draw_field_editor(f, cols[1], fe, &mut app.field_list),
+        Some(fe) => draw_field_editor(f, cols[1], fe, &mut lists.field),
         None => draw_rows_pane(f, cols[1], app, !containers_focused),
     }
 }
 
 /// Inline row editor: one `field: value` line per field, changed fields marked with `●`.
-fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, state: &mut ListState) {
+fn draw_field_editor(
+    f: &mut Frame,
+    area: Rect,
+    fe: &db9s_core::app::FieldEdit,
+    state: &mut ListState,
+) {
     let items: Vec<ListItem> = fe
         .edited
         .iter()
@@ -280,7 +372,7 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, stat
         .map(|(i, (k, v))| {
             let changed = fe.original.get(k) != Some(v);
             let value = match (&fe.input, i == fe.idx) {
-                (Some(input), true) => input.spans(true),
+                (Some(input), true) => input_spans(input, true),
                 _ => vec![Span::raw(compact(v))],
             };
             let mut style = Style::default();
@@ -290,12 +382,12 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, stat
             let mut spans = vec![
                 Span::styled(
                     if changed { "● " } else { "  " },
-                    Style::default().fg(theme::get().success),
+                    Style::default().fg(theme().success),
                 ),
                 Span::styled(
                     format!("{k}: "),
                     Style::default()
-                        .fg(theme::get().field_name)
+                        .fg(theme().field_name)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -306,7 +398,7 @@ fn draw_field_editor(f: &mut Frame, area: Rect, fe: &crate::app::FieldEdit, stat
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(theme::get().border_type)
+            .border_type(theme().border_type)
             .border_style(pane_border(true))
             .title("edit row"),
     );
@@ -323,7 +415,7 @@ fn draw_rows_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
     };
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_type(theme::get().border_type)
+        .border_type(theme().border_type)
         .border_style(pane_border(focused))
         .title(title);
     let inner = outer.inner(area);
@@ -368,7 +460,7 @@ fn draw_rows_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
                 Span::styled(
                     format!("{col}: "),
                     Style::default()
-                        .fg(theme::get().field_name)
+                        .fg(theme().field_name)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(compact(&val)),
@@ -377,11 +469,11 @@ fn draw_rows_pane(f: &mut Frame, area: Rect, app: &App, focused: bool) {
         let card = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::get().border_type)
+                .border_type(theme().border_type)
                 .border_style(if selected {
-                    Style::default().fg(theme::get().border_focus)
+                    Style::default().fg(theme().border_focus)
                 } else {
-                    Style::default().fg(theme::get().border_blur)
+                    Style::default().fg(theme().border_blur)
                 }),
         );
         f.render_widget(card, card_areas[slot]);
@@ -411,11 +503,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     } else {
                         "query> "
                     })],
-                    app.query_input.spans(true),
+                    input_spans(&app.query_input, true),
                 ]
                 .concat(),
             ))
-            .style(Style::default().fg(theme::get().selected_fg)),
+            .style(Style::default().fg(theme().selected_fg)),
             area,
         );
         return;
@@ -427,7 +519,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new("y/n").style(
                 Style::default()
-                    .fg(theme::get().error)
+                    .fg(theme().error)
                     .add_modifier(Modifier::BOLD),
             ),
             area,
@@ -437,11 +529,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut line = help_line(app.key_hints());
     if !app.status.is_empty() {
         let is_err = app.status.starts_with("error") || app.status.starts_with("failed");
-        let color = if is_err {
-            theme::get().error
-        } else {
-            theme::get().muted
-        };
+        let color = if is_err { theme().error } else { theme().muted };
         let status = Span::styled(app.status.clone(), Style::default().fg(color));
         // errors go first so a long key list never truncates them
         if is_err {
@@ -467,18 +555,18 @@ fn help_line(status: &str) -> Line<'static> {
                 spans.push(Span::styled(
                     key.to_string(),
                     Style::default()
-                        .fg(theme::get().key_hint)
+                        .fg(theme().key_hint)
                         .add_modifier(Modifier::BOLD),
                 ));
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     desc.to_string(),
-                    Style::default().fg(theme::get().muted),
+                    Style::default().fg(theme().muted),
                 ));
             }
             None => spans.push(Span::styled(
                 chunk.to_string(),
-                Style::default().fg(theme::get().muted),
+                Style::default().fg(theme().muted),
             )),
         }
     }
@@ -508,7 +596,7 @@ fn modal_block(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::get().modal_border))
+        .border_style(Style::default().fg(theme().modal_border))
         .title(title.to_string())
 }
 
@@ -526,7 +614,7 @@ fn draw_confirm_edit_popup(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         "save these changes? y/n",
         Style::default()
-            .fg(theme::get().success)
+            .fg(theme().success)
             .add_modifier(Modifier::BOLD),
     ))];
     lines.push(Line::raw(""));
@@ -543,12 +631,12 @@ fn draw_confirm_edit_popup(f: &mut Frame, app: &App) {
             Span::styled(
                 format!("{key}: "),
                 Style::default()
-                    .fg(theme::get().field_name)
+                    .fg(theme().field_name)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(old_s, Style::default().fg(theme::get().error)),
+            Span::styled(old_s, Style::default().fg(theme().error)),
             Span::raw(" -> "),
-            Span::styled(new_s, Style::default().fg(theme::get().success)),
+            Span::styled(new_s, Style::default().fg(theme().success)),
         ]));
     }
 
@@ -589,14 +677,15 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
         }
     };
     f.render_widget(
-        Paragraph::new(Line::from(
-            app.settings_editor_input.spans(!app.settings_on_theme),
-        ))
+        Paragraph::new(Line::from(input_spans(
+            &app.settings_editor_input,
+            !app.settings_on_theme,
+        )))
         .style(field_style(!app.settings_on_theme))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::get().border_type)
+                .border_type(theme().border_type)
                 .title("editor (for row/doc edit)"),
         ),
         rows[0],
@@ -607,17 +696,17 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(theme::get().border_type)
+                    .border_type(theme().border_type)
                     .title("theme (live preview)"),
             ),
         rows[1],
     );
 
     let (msg, color) = match &app.settings_error {
-        Some(err) => (err.as_str(), theme::get().error),
+        Some(err) => (err.as_str(), theme().error),
         None => (
             "saved to config.toml; custom themes go in <config dir>/themes/<name>.toml",
-            theme::get().muted,
+            theme().muted,
         ),
     };
     f.render_widget(
@@ -627,7 +716,7 @@ fn draw_settings_popup(f: &mut Frame, app: &App) {
 }
 
 fn draw_add_conn_popup(f: &mut Frame, app: &App) {
-    use crate::app::AddField;
+    use db9s_core::app::AddField;
 
     let area = centered(f.area(), 60, 60);
     f.render_widget(ratatui::widgets::Clear, area);
@@ -662,28 +751,29 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
     };
 
     f.render_widget(
-        Paragraph::new(Line::from(
-            app.new_conn_name
-                .spans(app.new_conn_field == AddField::Name),
-        ))
+        Paragraph::new(Line::from(input_spans(
+            &app.new_conn_name,
+            app.new_conn_field == AddField::Name,
+        )))
         .style(field_style(AddField::Name))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::get().border_type)
+                .border_type(theme().border_type)
                 .title("name"),
         ),
         rows[0],
     );
     f.render_widget(
-        Paragraph::new(Line::from(
-            app.new_conn_url.spans(app.new_conn_field == AddField::Url),
-        ))
+        Paragraph::new(Line::from(input_spans(
+            &app.new_conn_url,
+            app.new_conn_field == AddField::Url,
+        )))
         .style(field_style(AddField::Url))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(theme::get().border_type)
+                .border_type(theme().border_type)
                 .title("url"),
         ),
         rows[1],
@@ -699,7 +789,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(theme::get().border_type)
+                    .border_type(theme().border_type)
                     .title("kind (left/right)"),
             ),
         last_row[0],
@@ -715,7 +805,7 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(theme::get().border_type)
+                    .border_type(theme().border_type)
                     .title("read-only (space)"),
             ),
         last_row[1],
@@ -723,11 +813,11 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
 
     if let Some(msg) = &app.new_conn_error {
         let color = if msg.starts_with("connected") || msg == "connection ok" {
-            theme::get().success
+            theme().success
         } else if msg == "connecting..." {
-            theme::get().selected_fg
+            theme().selected_fg
         } else {
-            theme::get().error
+            theme().error
         };
         f.render_widget(
             Paragraph::new(msg.as_str()).style(Style::default().fg(color)),
@@ -750,7 +840,7 @@ fn draw_confirm_popup(f: &mut Frame, text: &str) {
         Paragraph::new(text)
             .style(
                 Style::default()
-                    .fg(theme::get().success)
+                    .fg(theme().success)
                     .add_modifier(Modifier::BOLD),
             )
             .block(modal_block("confirm")),

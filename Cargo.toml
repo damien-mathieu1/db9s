@@ -1,7 +1,16 @@
-[package]
-name = "db9s"
+[workspace]
+members = ["crates/db9s-core"]
+
+[workspace.package]
 version = "2026.11.3"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/damien-mathieu1/db9s"
+
+[package]
+name = "db9s"
+version.workspace = true
+edition.workspace = true
 description = "k9s-style terminal UI to browse, query, and edit Postgres, MySQL, MongoDB, Redis and RabbitMQ"
 license = "MIT"
 repository = "https://github.com/damien-mathieu1/db9s"
@@ -11,25 +20,14 @@ categories = ["command-line-utilities", "database"]
 exclude = ["dev/", "docker-compose.yml", ".github/"]
 
 [dependencies]
+# exact pin: both crates are always released together, at the same version
+db9s-core = { path = "crates/db9s-core", version = "=2026.11.3" }
 ratatui = "0.29"
 crossterm = "0.28"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "uuid", "json", "rust_decimal"] }
-mongodb = { version = "3", features = ["rustls-tls"] }
-bson = { version = "2", features = ["serde_with-3", "chrono-0_4"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-toml = "0.8"
-anyhow = "1"
-async-trait = "0.1"
-futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
-directories = "5"
-chrono = "0.4"
-uuid = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-lapin = { version = "4", default-features = false, features = ["tokio", "rustls--ring", "rustls-webpki-roots-certs"] }
-redis = { version = "1.8", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+anyhow = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]
 lto = true
