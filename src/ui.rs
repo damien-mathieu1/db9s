@@ -155,6 +155,60 @@ pub fn draw(f: &mut Frame, app: &App, lists: &mut Lists) {
     if matches!(app.mode, Mode::Settings) {
         draw_settings_popup(f, app);
     }
+    if matches!(app.mode, Mode::Schema) {
+        draw_schema_popup(f, app);
+    }
+}
+
+/// `i`: the container's columns as an aligned table.
+fn draw_schema_popup(f: &mut Frame, app: &App) {
+    let Some(schema) = &app.schema else {
+        return;
+    };
+    let cells = |r: &db9s_core::value::Row| -> Vec<String> {
+        schema
+            .columns
+            .iter()
+            .map(|c| r.get(c).map(compact).unwrap_or_default())
+            .collect()
+    };
+    let rows: Vec<Vec<String>> = schema.rows.iter().map(cells).collect();
+    let widths: Vec<usize> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            rows.iter()
+                .map(|r| r[i].chars().count())
+                .chain([c.chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let pad = |cols: &[String]| -> String {
+        cols.iter()
+            .zip(&widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        pad(&schema.columns),
+        Style::default()
+            .fg(theme().field_name)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(rows.iter().map(|r| Line::raw(pad(r))));
+    let title = format!(
+        "schema: {}  (esc close)",
+        app.containers
+            .get(app.container_idx)
+            .cloned()
+            .unwrap_or_default()
+    );
+    let area = centered(f.area(), 80, 70);
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(Paragraph::new(lines).block(modal_block(&title)), area);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -400,7 +454,7 @@ fn draw_field_editor(
             .borders(Borders::ALL)
             .border_type(theme().border_type)
             .border_style(pane_border(true))
-            .title("edit row"),
+            .title(if fe.insert { "new row" } else { "edit row" }),
     );
     state.select((!fe.edited.is_empty()).then_some(fe.idx));
     f.render_stateful_widget(list, area, state);

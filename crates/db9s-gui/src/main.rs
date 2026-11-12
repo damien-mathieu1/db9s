@@ -614,7 +614,11 @@ impl Db9s {
                     .filter_map(|i| Some((i, res.rows.get(i)?)))
                     .map(|(i, row)| {
                         // the selected row, while field-edited, shows its pending values
-                        let fe = app.field_edit.as_ref().filter(|_| selected == Some(i));
+                        // (a new row isn't in the page: it only shows in the panel below)
+                        let fe = app
+                            .field_edit
+                            .as_ref()
+                            .filter(|fe| selected == Some(i) && !fe.insert);
                         let row = fe.map_or(row, |fe| &fe.edited);
                         let current = fe.and_then(|fe| fe.edited.keys().nth(fe.idx));
                         let cells = res.columns.iter().zip(widths.iter()).map(|(col, w)| {
@@ -1000,7 +1004,16 @@ fn field_editor(fe: &FieldEdit, p: &Palette) -> Div {
             l
         }
     });
-    pane("edit row", p.border_focus, p).children(lines)
+    pane(
+        if fe.insert {
+            "new row  (null = database default)"
+        } else {
+            "edit row"
+        },
+        p.border_focus,
+        p,
+    )
+    .children(lines)
 }
 
 fn footer(app: &App, p: &Palette) -> Div {
@@ -1215,6 +1228,37 @@ fn modal(app: &App, p: &Palette) -> Option<Div> {
                     ),
             )
             .child(line(vec![msg]))
+        }
+        Mode::Schema => {
+            let schema = app.schema.as_ref()?;
+            let container = app
+                .containers
+                .get(app.container_idx)
+                .cloned()
+                .unwrap_or_default();
+            let row = |cells: Vec<Span>| {
+                div().flex().flex_row().children(cells.into_iter().map(|c| {
+                    div()
+                        .w(px(150.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .child(line(vec![c]))
+                }))
+            };
+            modal_box(format!("schema: {container}  (esc close)"), p)
+                .w(px(820.))
+                .child(row(schema
+                    .columns
+                    .iter()
+                    .map(|c| styled(c.clone(), p.field_name).bold())
+                    .collect()))
+                .children(schema.rows.iter().map(|r| {
+                    row(schema
+                        .columns
+                        .iter()
+                        .map(|c| raw(r.get(c).map(compact).unwrap_or_default()))
+                        .collect())
+                }))
         }
         Mode::Normal | Mode::Query | Mode::FieldEdit | Mode::Command => return None,
     })

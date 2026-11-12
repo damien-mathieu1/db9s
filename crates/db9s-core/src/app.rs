@@ -38,6 +38,8 @@ pub enum Mode {
     Settings,
     /// k9s-style `:` prompt to jump to a connection, database or container by name.
     Command,
+    /// The current container's columns (`i`), in `App::schema`.
+    Schema,
 }
 
 /// Inline, field-by-field edit of one row/document, saved in one update.
@@ -47,6 +49,8 @@ pub struct FieldEdit {
     pub idx: usize,
     /// `Some` while the selected field's value is being typed.
     pub input: Option<Input>,
+    /// A new row (`a`): saved with an insert, fields left null get the database default.
+    pub insert: bool,
 }
 
 /// A row/document sent out to the user's $EDITOR; picked up by the main loop
@@ -130,6 +134,8 @@ pub struct App {
     pub sort: Option<Sort>,
     /// Rows in the current container, when the backend counts them.
     pub total: Option<u64>,
+    /// What `i` shows: one row per column of the current container.
+    pub schema: Option<QueryResult>,
 
     pub query_input: Input,
     pub status: String,
@@ -229,6 +235,8 @@ enum Done {
     Query(QueryResult),
     Saved,
     Deleted,
+    Inserted,
+    Schema(QueryResult),
 }
 
 struct Pending {
@@ -290,6 +298,7 @@ impl App {
             offset: 0,
             sort: None,
             total: None,
+            schema: None,
             query_input: Input::default(),
             status: theme_error.unwrap_or_default(),
             should_quit: false,
@@ -386,6 +395,18 @@ impl App {
             Done::Deleted => {
                 self.status = "deleted".into();
                 self.load_rows();
+            }
+            Done::Inserted => {
+                self.status = "inserted".into();
+                self.load_rows();
+            }
+            Done::Schema(res) => {
+                self.status = String::new();
+                // only if nothing else took the screen while it loaded
+                if matches!(self.mode, Mode::Normal) {
+                    self.schema = Some(res);
+                    self.mode = Mode::Schema;
+                }
             }
         }
     }
@@ -533,6 +554,15 @@ impl App {
             Mode::ConfirmDeleteConn => self.handle_confirm_delete_conn_key(key).await,
             Mode::Settings => self.handle_settings_key(key),
             Mode::Command => self.handle_command_key(key).await,
+            Mode::Schema => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'i')
+                ) {
+                    self.schema = None;
+                    self.mode = Mode::Normal;
+                }
+            }
         }
     }
 
@@ -577,8 +607,15 @@ impl App {
                 self.mode = Mode::Query;
                 self.query_input = Input::default();
             }
-            KeyCode::Char('e' | 'E' | 'd') if self.rows_focused() && self.is_read_only() => {
-                self.status = "read-only connection: edit and delete are off".into();
+            KeyCode::Char('e' | 'E' | 'd' | 'a') if self.rows_focused() && self.is_read_only() => {
+                self.status = "read-only connection: insert, edit and delete are off".into();
+            }
+            KeyCode::Char('a') if self.rows_focused() && self.is_queue() => {
+                self.status = "use / to publish a message".into();
+            }
+            KeyCode::Char('a') if self.rows_focused() => self.start_insert(),
+            KeyCode::Char('i') if self.screen == Screen::Browse && !self.is_queue() => {
+                self.load_schema()
             }
             KeyCode::Char('e') | KeyCode::Char('E') if self.rows_focused() && self.is_queue() => {
                 self.status = "rabbitmq messages are read-only".into();
@@ -608,6 +645,9 @@ impl App {
         if matches!(self.mode, Mode::Command) {
             return "enter run  tab/→ complete  ↑/↓ suggestions  esc cancel";
         }
+        if matches!(self.mode, Mode::Schema) {
+            return "esc/i close";
+        }
         if matches!(self.mode, Mode::Settings) {
             return "tab switch_field  ←/→ preview_theme  enter save  esc cancel";
         }
@@ -622,18 +662,23 @@ impl App {
             Screen::Connections => "j/k move  enter open  a add  e edit  d delete  s settings  : command  q quit",
             Screen::Databases => "j/k move  enter open  : command  esc back",
             Screen::Browse => match self.browse_focus {
-                BrowseFocus::Containers => "j/k move+preview  enter/tab rows  : command  esc back",
+                BrowseFocus::Containers if self.is_queue() => {
+                    "j/k move+preview  enter/tab rows  : command  esc back"
+                }
+                BrowseFocus::Containers => {
+                    "j/k move+preview  enter/tab rows  i schema  : command  esc back"
+                }
                 BrowseFocus::Rows if self.is_read_only() && self.is_queue() => {
                     "j/k move  n/p page  r refresh  tab queues  esc back"
                 }
                 BrowseFocus::Rows if self.is_read_only() => {
-                    "j/k move  / query  n/p page  r refresh  tab containers  esc back"
+                    "j/k move  / query  i schema  n/p page  r refresh  tab containers  esc back"
                 }
                 BrowseFocus::Rows if self.is_queue() => {
                     "j/k move  / publish  d purge queue  n/p page  r refresh  tab queues  esc back"
                 }
                 BrowseFocus::Rows => {
-                    "j/k move  e edit  E $EDITOR  d delete  / query  n/p page  r refresh  tab containers  esc back"
+                    "j/k move  e edit  E $EDITOR  a insert  d delete  / query  i schema  n/p page  r refresh  tab containers  esc back"
                 }
             },
         }
@@ -1030,8 +1075,55 @@ impl App {
             edited: row,
             idx: 0,
             input: None,
+            insert: false,
         });
         self.mode = Mode::FieldEdit;
+    }
+
+    /// A blank row with the page's columns, edited like any row and inserted on save.
+    fn start_insert(&mut self) {
+        let Some(res) = &self.result else {
+            return;
+        };
+        let blank: Row = res
+            .columns
+            .iter()
+            .map(|c| (c.clone(), serde_json::Value::Null))
+            .collect();
+        if blank.is_empty() {
+            self.status = "error: no columns to fill in (empty table?), use / to insert".into();
+            return;
+        }
+        self.field_edit = Some(FieldEdit {
+            original: blank.clone(),
+            edited: blank,
+            idx: 0,
+            input: None,
+            insert: true,
+        });
+        self.mode = Mode::FieldEdit;
+    }
+
+    fn insert_row(&mut self, row: Row) {
+        let db = self.current_db().unwrap_or_default().to_string();
+        let container = self.current_container().unwrap_or_default().to_string();
+        // null = not set: let the database fill ids and defaults
+        let row: Row = row.into_iter().filter(|(_, v)| !v.is_null()).collect();
+        self.start("inserting...", true, move |s| async move {
+            s.insert_row(&db, &container, &row)
+                .await
+                .map(|_| Done::Inserted)
+        });
+    }
+
+    fn load_schema(&mut self) {
+        let db = self.current_db().unwrap_or_default().to_string();
+        let Some(container) = self.current_container().map(str::to_string) else {
+            return;
+        };
+        self.start("loading schema...", false, move |s| async move {
+            s.describe(&db, &container).await.map(Done::Schema)
+        });
     }
 
     async fn handle_field_edit_key(&mut self, key: KeyEvent) {
@@ -1048,8 +1140,9 @@ impl App {
             match key.code {
                 KeyCode::Enter => {
                     let before = crate::value::value_to_input(&fe.edited[&field]);
-                    // untouched text keeps its original type (string "42" stays a string)
-                    if input.value() != before {
+                    // untouched text keeps its original type (string "42" stays a string);
+                    // on a new row, a field left empty stays null (= database default)
+                    if input.value() != before && !(fe.insert && input.value().is_empty()) {
                         let v = crate::value::input_to_value(input.value());
                         fe.edited.insert(field, v);
                     }
@@ -1069,13 +1162,22 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => fe.idx = fe.idx.saturating_sub(1),
             KeyCode::Enter => {
-                fe.input = Some(Input::new(crate::value::value_to_input(&fe.edited[&field])))
+                let v = &fe.edited[&field];
+                // a new row's unset field starts empty, not as the text "null"
+                let text = if fe.insert && v.is_null() {
+                    String::new()
+                } else {
+                    crate::value::value_to_input(v)
+                };
+                fe.input = Some(Input::new(text))
             }
             KeyCode::Char('s') if key.ctrl => {
                 let fe = self.field_edit.take().unwrap();
                 self.mode = Mode::Normal;
                 if fe.edited == fe.original {
                     self.status = "no changes".into();
+                } else if fe.insert {
+                    self.insert_row(fe.edited);
                 } else {
                     self.save_row(&fe.original, &fe.edited);
                 }
@@ -1395,10 +1497,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Answers after `delay`; records whether a delete went through.
+    /// Answers after `delay`; records whether a delete went through and what was inserted.
     struct Slow {
         delay: Duration,
         deleted: Arc<AtomicBool>,
+        inserted: Arc<std::sync::Mutex<Vec<Row>>>,
     }
 
     #[async_trait::async_trait]
@@ -1412,8 +1515,8 @@ mod tests {
         }
         async fn fetch_rows(&self, _: &str, _: &str, _: i64, _: i64) -> Result<QueryResult> {
             Ok(QueryResult {
-                columns: vec!["id".into()],
-                rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
+                columns: vec!["id".into(), "name".into()],
+                rows: vec![serde_json::from_str(r#"{"id": 1, "name": "a"}"#).unwrap()],
                 affected: None,
             })
         }
@@ -1434,6 +1537,22 @@ mod tests {
         async fn update_row(&self, _: &str, _: &str, _: &Row, _: &Row) -> Result<()> {
             Ok(())
         }
+        async fn insert_row(&self, _: &str, _: &str, row: &Row) -> Result<()> {
+            self.inserted.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+        async fn describe(&self, _: &str, _: &str) -> Result<QueryResult> {
+            Ok(QueryResult {
+                columns: vec!["column".into()],
+                rows: vec![serde_json::from_str(r#"{"column": "id"}"#).unwrap()],
+                affected: None,
+            })
+        }
+    }
+
+    thread_local! {
+        /// What the current test's `Slow` source inserted.
+        static INSERTED: Arc<std::sync::Mutex<Vec<Row>>> = Arc::default();
     }
 
     async fn app_with(delay: Duration) -> (App, Arc<AtomicBool>) {
@@ -1447,6 +1566,7 @@ mod tests {
             source: Ok(Arc::new(Slow {
                 delay,
                 deleted: deleted.clone(),
+                inserted: INSERTED.with(|i| i.clone()),
             })),
         });
         app.mode = Mode::Normal;
@@ -1519,6 +1639,46 @@ mod tests {
         }
         press(app, KeyCode::Enter).await;
         settle(app).await;
+    }
+
+    async fn open_table(app: &mut App) {
+        press(app, KeyCode::Enter).await;
+        settle(app).await;
+        press(app, KeyCode::Enter).await;
+        settle(app).await;
+        app.browse_focus = BrowseFocus::Rows;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_inserts_only_the_fields_that_were_set() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        press(&mut app, KeyCode::Char('a')).await;
+        assert!(app.field_edit.as_ref().is_some_and(|fe| fe.insert));
+        for k in [KeyCode::Enter, KeyCode::Char('7'), KeyCode::Enter] {
+            press(&mut app, k).await;
+        }
+        app.handle_key(KeyEvent::ctrl(KeyCode::Char('s'))).await;
+        settle(&mut app).await;
+        let inserted = INSERTED.with(|i| i.lock().unwrap().clone());
+        assert_eq!(
+            inserted,
+            [serde_json::from_str::<Row>(r#"{"id": 7}"#).unwrap()]
+        );
+        assert!(app.status.starts_with("1 rows"), "reloaded: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn i_shows_the_schema_and_esc_closes_it() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        press(&mut app, KeyCode::Char('i')).await;
+        settle(&mut app).await;
+        assert!(matches!(app.mode, Mode::Schema));
+        assert_eq!(app.schema.as_ref().unwrap().rows.len(), 1);
+        press(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.schema.is_none());
     }
 
     #[tokio::test]

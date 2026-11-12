@@ -83,6 +83,17 @@ pub trait DataSource: Send + Sync {
 
     async fn delete_row(&self, database: &str, container: &str, row: &Row) -> Result<()>;
 
+    /// Adds `row`; fields left out get the database's defaults (serial ids, `_id`...).
+    async fn insert_row(&self, _database: &str, _container: &str, _row: &Row) -> Result<()> {
+        Err(anyhow!("this backend can't insert rows"))
+    }
+
+    /// The container's columns: one row per column (name, type, nullable, default, key),
+    /// or per field seen in a sample for schemaless stores.
+    async fn describe(&self, _database: &str, _container: &str) -> Result<QueryResult> {
+        Err(anyhow!("this backend has no schema view"))
+    }
+
     async fn update_row(
         &self,
         database: &str,
@@ -156,6 +167,14 @@ impl DataSource for ReadOnly {
 
     async fn delete_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
         Err(anyhow!("read-only connection: delete refused"))
+    }
+
+    async fn insert_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
+        Err(anyhow!("read-only connection: insert refused"))
+    }
+
+    async fn describe(&self, database: &str, container: &str) -> Result<QueryResult> {
+        self.0.describe(database, container).await
     }
 
     async fn update_row(&self, _: &str, _: &str, _: &Row, _: &Row) -> Result<()> {

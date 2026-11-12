@@ -175,6 +175,50 @@ impl DataSource for MongoSource {
         Ok(())
     }
 
+    async fn insert_row(&self, database: &str, container: &str, row: &Row) -> Result<()> {
+        let coll = self
+            .client
+            .database(database)
+            .collection::<mongodb::bson::Document>(container);
+        let doc = mongodb::bson::to_document(&serde_json::Value::Object(row.clone()))?;
+        coll.insert_one(doc).await?;
+        Ok(())
+    }
+
+    /// Schemaless: the fields of the first 100 documents, with the JSON types seen
+    /// and how many documents have each.
+    async fn describe(&self, database: &str, container: &str) -> Result<QueryResult> {
+        let sample = self.page(database, container, 100, 0, None).await?;
+        let n = sample.rows.len();
+        let rows = sample
+            .columns
+            .iter()
+            .map(|col| {
+                let mut types: Vec<&str> = vec![];
+                let mut seen = 0;
+                for r in &sample.rows {
+                    if let Some(v) = r.get(col) {
+                        seen += 1;
+                        let t = json_type(v);
+                        if !types.contains(&t) {
+                            types.push(t);
+                        }
+                    }
+                }
+                let mut row = Row::new();
+                row.insert("field".into(), col.clone().into());
+                row.insert("types".into(), types.join(" | ").into());
+                row.insert("in".into(), format!("{seen}/{n}").into());
+                row
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: vec!["field".into(), "types".into(), "in".into()],
+            rows,
+            affected: None,
+        })
+    }
+
     async fn update_row(
         &self,
         database: &str,
@@ -194,6 +238,18 @@ impl DataSource for MongoSource {
         coll.update_one(doc! { "_id": id_filter(id)? }, doc! { "$set": new_doc })
             .await?;
         Ok(())
+    }
+}
+
+fn json_type(v: &serde_json::Value) -> &'static str {
+    use serde_json::Value;
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

@@ -21,6 +21,10 @@ impl SqlDialect for PgDialect {
          WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 \
          ORDER BY kcu.ordinal_position";
     const READ_ONLY_SESSION: &'static str = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY";
+    const DESCRIBE: &'static str = "SELECT column_name::text AS column, data_type::text AS type, \
+         is_nullable::text AS nullable, column_default::text AS default \
+         FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 \
+         ORDER BY ordinal_position";
 
     fn quote(ident: &str) -> String {
         format!("\"{}\"", ident.replace('"', "\"\""))

@@ -23,6 +23,9 @@ pub trait SqlDialect: Send + Sync + 'static {
     const PRIMARY_KEY: &'static str;
     /// Makes the session reject writes, run on each connection of a read-only source.
     const READ_ONLY_SESSION: &'static str;
+    /// Columns of (schema, table) bound as parameters, in order, as text columns
+    /// `column`, `type`, `nullable`, `default`.
+    const DESCRIBE: &'static str;
 
     fn quote(ident: &str) -> String;
     /// Bind marker for the n-th parameter (1-based), e.g. `$1` or `?`.
@@ -285,6 +288,46 @@ where
             Self::table(database, table)
         );
         self.execute(&sql, &values).await
+    }
+
+    async fn insert_row(&self, database: &str, table: &str, row: &Row) -> Result<()> {
+        if row.is_empty() {
+            return Err(anyhow!("set at least one field to insert a row"));
+        }
+        let cols = row
+            .keys()
+            .map(|k| D::quote(k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = (1..=row.len())
+            .map(D::placeholder)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({cols}) VALUES ({marks})",
+            Self::table(database, table)
+        );
+        let values: Vec<Value> = row.values().cloned().collect();
+        self.execute(&sql, &values).await
+    }
+
+    async fn describe(&self, database: &str, table: &str) -> Result<QueryResult> {
+        let mut q = sqlx::query::<D::DB>(D::DESCRIBE);
+        q = q.bind(database.to_string()).bind(table.to_string());
+        let mut res = Self::to_result(&q.fetch_all(&self.pool).await?);
+        let pk = self.names(D::PRIMARY_KEY, &[database, table]).await?;
+        for row in &mut res.rows {
+            let is_pk = row
+                .get("column")
+                .and_then(Value::as_str)
+                .is_some_and(|c| pk.iter().any(|k| k == c));
+            row.insert(
+                "key".into(),
+                Value::String(if is_pk { "PK" } else { "" }.into()),
+            );
+        }
+        res.columns.push("key".into());
+        Ok(res)
     }
 
     async fn update_row(

@@ -78,6 +78,21 @@ async fn exercise(source: &dyn DataSource, db: &str, container: &str, query_for_
     let res = source.fetch_rows(db, container, 10, 0).await.unwrap();
     assert_eq!(res.rows.len(), 1);
     assert_eq!(res.rows[0]["name"], json!("z"));
+
+    // only `name`: the id comes from the database
+    let mut new_row = crate::value::Row::new();
+    new_row.insert("name".into(), json!("y"));
+    source.insert_row(db, container, &new_row).await.unwrap();
+    let res = source.fetch_rows(db, container, 10, 0).await.unwrap();
+    assert!(res.rows.iter().any(|r| r["name"] == json!("y")));
+    assert_eq!(res.rows.len(), 2);
+
+    let schema = source.describe(db, container).await.unwrap();
+    assert!(
+        schema.rows.iter().any(|r| r.values().any(|v| v == "name")),
+        "{:?}",
+        schema.rows
+    );
 }
 
 #[tokio::test]
