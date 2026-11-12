@@ -132,14 +132,16 @@ pub fn draw(f: &mut Frame, app: &App, lists: &mut Lists) {
         draw_confirm_edit_popup(f, app);
     }
     if matches!(app.mode, Mode::ConfirmDelete) {
-        draw_confirm_popup(
-            f,
-            if app.is_queue() {
-                "purge every message in this queue?"
-            } else {
-                "delete this row/document?"
-            },
-        );
+        let question = if app.is_queue() {
+            "purge every message in this queue?"
+        } else {
+            "delete this row/document?"
+        };
+        let text = match &app.confirm_preview {
+            Some(sql) => format!("{question}\n\n{sql}"),
+            None => question.to_string(),
+        };
+        draw_confirm_popup(f, &text);
     }
     if matches!(app.mode, Mode::ConfirmDeleteConn) {
         let name = app
@@ -694,10 +696,20 @@ fn draw_confirm_edit_popup(f: &mut Frame, app: &App) {
         ]));
     }
 
+    if let Some(sql) = &app.confirm_preview {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            sql.clone(),
+            Style::default().fg(theme().muted),
+        )));
+    }
+
     let area = centered(f.area(), 70, 60);
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(modal_block("confirm edit")),
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(modal_block("confirm edit")),
         area,
     );
 }
@@ -888,10 +900,11 @@ fn draw_add_conn_popup(f: &mut Frame, app: &App) {
 }
 
 fn draw_confirm_popup(f: &mut Frame, text: &str) {
-    let area = centered(f.area(), 40, 15);
+    let area = centered(f.area(), 60, 25);
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
         Paragraph::new(text)
+            .wrap(ratatui::widgets::Wrap { trim: false })
             .style(
                 Style::default()
                     .fg(theme().success)

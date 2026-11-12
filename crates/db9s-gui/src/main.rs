@@ -1081,6 +1081,12 @@ fn modal_box(title: impl Into<SharedString>, p: &Palette) -> Div {
         .child(div().text_color(p.modal_border).child(title.into()))
 }
 
+/// The statement the open confirm would run, wrapped, once the backend says.
+fn preview(app: &App, p: &Palette) -> Option<Div> {
+    let sql = app.confirm_preview.clone()?;
+    Some(div().text_color(p.muted).child(sql))
+}
+
 /// A labelled form field, highlighted when it has focus.
 fn field(label: &str, value: Vec<Span>, focused: bool, p: &Palette) -> Div {
     let d = div()
@@ -1101,15 +1107,17 @@ fn field(label: &str, value: Vec<Span>, focused: bool, p: &Palette) -> Div {
 
 fn modal(app: &App, p: &Palette) -> Option<Div> {
     Some(match app.mode {
-        Mode::ConfirmDelete => modal_box("confirm", p).child(line(vec![styled(
-            if app.is_queue() {
-                "purge every message in this queue?"
-            } else {
-                "delete this row/document?"
-            },
-            p.success,
-        )
-        .bold()])),
+        Mode::ConfirmDelete => modal_box("confirm", p)
+            .child(line(vec![styled(
+                if app.is_queue() {
+                    "purge every message in this queue?"
+                } else {
+                    "delete this row/document?"
+                },
+                p.success,
+            )
+            .bold()]))
+            .children(preview(app, p)),
         Mode::ConfirmDeleteConn => {
             let name = app.conns.get(app.conn_idx).map_or("", |c| c.name.as_str());
             modal_box("confirm", p).child(line(vec![styled(
@@ -1139,6 +1147,7 @@ fn modal(app: &App, p: &Palette) -> Option<Div> {
                     styled("save these changes? y/n", p.success).bold()
                 ]))
                 .children(diffs)
+                .children(preview(app, p))
         }
         Mode::Settings => modal_box("settings (tab field, ←/→ theme, enter save, esc cancel)", p)
             .child(field(

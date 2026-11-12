@@ -13,6 +13,20 @@ use std::sync::Mutex;
 
 pub type ConnOptions<DB> = <<DB as Database>::Connection as Connection>::Options;
 
+/// Writes the n-th (1-based) value's spot in a statement: a bind placeholder, or a literal.
+type Mark<'a> = &'a (dyn Fn(usize, &Value) -> String + Sync);
+
+/// A value as an SQL literal, to show a statement (never to run one: those bind values).
+fn literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => b.to_string().to_uppercase(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
 pub trait SqlDialect: Send + Sync + 'static {
     type DB: Database;
     /// Lists browsable schemas/databases, one text column.
@@ -125,13 +139,15 @@ where
         Ok(pool)
     }
 
-    /// `WHERE pk1 = ? AND pk2 = ?` for `row`, numbering placeholders from `first`.
+    /// `WHERE pk1 = ? AND pk2 = ?` for `row`, numbering placeholders from `first`;
+    /// `mark` writes each value's spot: a placeholder to run, a literal to show.
     async fn where_pk(
         &self,
         database: &str,
         table: &str,
         row: &Row,
         first: usize,
+        mark: Mark<'_>,
     ) -> Result<(String, Vec<Value>)> {
         let pk = self.names(D::PRIMARY_KEY, &[database, table]).await?;
         if pk.is_empty() {
@@ -147,7 +163,11 @@ where
                     .cloned()
                     .ok_or_else(|| anyhow!("row is missing primary key column {col}"))?,
             );
-            clauses.push(format!("{} = {}", D::quote(col), D::placeholder(first + i)));
+            clauses.push(format!(
+                "{} = {}",
+                D::quote(col),
+                mark(first + i, &row[col])
+            ));
         }
         Ok((clauses.join(" AND "), values))
     }
@@ -170,6 +190,55 @@ where
         );
         let rows = sqlx::query::<D::DB>(&sql).fetch_all(&self.pool).await?;
         Ok(Self::to_result(&rows))
+    }
+
+    async fn delete_sql(
+        &self,
+        database: &str,
+        table: &str,
+        row: &Row,
+        mark: Mark<'_>,
+    ) -> Result<(String, Vec<Value>)> {
+        let (clause, values) = self.where_pk(database, table, row, 1, mark).await?;
+        let sql = format!(
+            "DELETE FROM {} WHERE {clause}",
+            Self::table(database, table)
+        );
+        Ok((sql, values))
+    }
+
+    /// The UPDATE for the fields that changed, or None if nothing did.
+    async fn update_sql(
+        &self,
+        database: &str,
+        table: &str,
+        original: &Row,
+        edited: &Row,
+        mark: Mark<'_>,
+    ) -> Result<Option<(String, Vec<Value>)>> {
+        let changed: Vec<(&String, &Value)> = edited
+            .iter()
+            .filter(|(k, v)| original.get(*k) != Some(*v))
+            .collect();
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let set = changed
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| format!("{} = {}", D::quote(k), mark(i + 1, v)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (clause, key_values) = self
+            .where_pk(database, table, original, changed.len() + 1, mark)
+            .await?;
+        let sql = format!(
+            "UPDATE {} SET {set} WHERE {clause}",
+            Self::table(database, table)
+        );
+        let mut values: Vec<Value> = changed.into_iter().map(|(_, v)| v.clone()).collect();
+        values.extend(key_values);
+        Ok(Some((sql, values)))
     }
 
     async fn execute(&self, sql: &str, values: &[Value]) -> Result<()> {
@@ -282,12 +351,35 @@ where
     }
 
     async fn delete_row(&self, database: &str, table: &str, row: &Row) -> Result<()> {
-        let (clause, values) = self.where_pk(database, table, row, 1).await?;
-        let sql = format!(
-            "DELETE FROM {} WHERE {clause}",
-            Self::table(database, table)
-        );
+        let (sql, values) = self
+            .delete_sql(database, table, row, &|n, _| D::placeholder(n))
+            .await?;
         self.execute(&sql, &values).await
+    }
+
+    async fn preview_delete(
+        &self,
+        database: &str,
+        table: &str,
+        row: &Row,
+    ) -> Result<Option<String>> {
+        let (sql, _) = self
+            .delete_sql(database, table, row, &|_, v| literal(v))
+            .await?;
+        Ok(Some(sql))
+    }
+
+    async fn preview_update(
+        &self,
+        database: &str,
+        table: &str,
+        original: &Row,
+        edited: &Row,
+    ) -> Result<Option<String>> {
+        let sql = self
+            .update_sql(database, table, original, edited, &|_, v| literal(v))
+            .await?;
+        Ok(sql.map(|(sql, _)| sql))
     }
 
     async fn insert_row(&self, database: &str, table: &str, row: &Row) -> Result<()> {
@@ -337,35 +429,29 @@ where
         original: &Row,
         edited: &Row,
     ) -> Result<()> {
-        let changed: Vec<(&String, &Value)> = edited
-            .iter()
-            .filter(|(k, v)| original.get(*k) != Some(*v))
-            .collect();
-        if changed.is_empty() {
-            return Ok(());
+        match self
+            .update_sql(database, table, original, edited, &|n, _| D::placeholder(n))
+            .await?
+        {
+            Some((sql, values)) => self.execute(&sql, &values).await,
+            None => Ok(()),
         }
-        let set = changed
-            .iter()
-            .enumerate()
-            .map(|(i, (k, _))| format!("{} = {}", D::quote(k), D::placeholder(i + 1)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (clause, key_values) = self
-            .where_pk(database, table, original, changed.len() + 1)
-            .await?;
-        let sql = format!(
-            "UPDATE {} SET {set} WHERE {clause}",
-            Self::table(database, table)
-        );
-        let mut values: Vec<Value> = changed.into_iter().map(|(_, v)| v.clone()).collect();
-        values.extend(key_values);
-        self.execute(&sql, &values).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_read_sql, returns_rows};
+    use super::{is_read_sql, literal, returns_rows};
+    use serde_json::json;
+
+    #[test]
+    fn literals_for_shown_statements() {
+        assert_eq!(literal(&json!("O'Brien")), "'O''Brien'");
+        assert_eq!(literal(&json!(null)), "NULL");
+        assert_eq!(literal(&json!(4.5)), "4.5");
+        assert_eq!(literal(&json!(true)), "TRUE");
+        assert_eq!(literal(&json!({"a": "b'c"})), "'{\"a\":\"b''c\"}'");
+    }
 
     #[test]
     fn detects_queries_that_return_rows() {

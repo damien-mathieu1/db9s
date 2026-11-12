@@ -136,6 +136,11 @@ pub struct App {
     pub total: Option<u64>,
     /// What `i` shows: one row per column of the current container.
     pub schema: Option<QueryResult>,
+    /// The statement the open delete/save confirm would run, once the backend says.
+    pub confirm_preview: Option<String>,
+    history: crate::history::History,
+    /// Which history entry ↑/↓ shows in the query prompt; None = what's being typed.
+    history_idx: Option<usize>,
 
     pub query_input: Input,
     pub status: String,
@@ -237,6 +242,8 @@ enum Done {
     Deleted,
     Inserted,
     Schema(QueryResult),
+    /// The statement a pending confirm would run.
+    Preview(Option<String>),
 }
 
 struct Pending {
@@ -299,6 +306,9 @@ impl App {
             sort: None,
             total: None,
             schema: None,
+            confirm_preview: None,
+            history: crate::history::load(),
+            history_idx: None,
             query_input: Input::default(),
             status: theme_error.unwrap_or_default(),
             should_quit: false,
@@ -399,6 +409,11 @@ impl App {
             Done::Inserted => {
                 self.status = "inserted".into();
                 self.load_rows();
+            }
+            Done::Preview(sql) => {
+                if matches!(self.mode, Mode::ConfirmDelete | Mode::ConfirmEditSave) {
+                    self.confirm_preview = sql;
+                }
             }
             Done::Schema(res) => {
                 self.status = String::new();
@@ -606,6 +621,7 @@ impl App {
             KeyCode::Char('/') if self.rows_focused() => {
                 self.mode = Mode::Query;
                 self.query_input = Input::default();
+                self.history_idx = None;
             }
             KeyCode::Char('e' | 'E' | 'd' | 'a') if self.rows_focused() && self.is_read_only() => {
                 self.status = "read-only connection: insert, edit and delete are off".into();
@@ -624,6 +640,8 @@ impl App {
             KeyCode::Char('E') if self.rows_focused() => self.start_edit(),
             KeyCode::Char('d') if self.rows_focused() && self.selected_row().is_some() => {
                 self.mode = Mode::ConfirmDelete;
+                let row = self.selected_row().unwrap().clone();
+                self.preview(move |s, db, c| async move { s.preview_delete(&db, &c, &row).await });
             }
             KeyCode::Char(':') => {
                 self.command_input = Input::default();
@@ -695,6 +713,7 @@ impl App {
         if self.screen == Screen::Browse {
             out.extend(self.containers.iter().cloned());
             if let Some(res) = &self.result {
+                out.extend(["export csv".into(), "export json".into()]);
                 out.push("sort".into());
                 for c in &res.columns {
                     out.push(format!("sort {c}"));
@@ -772,6 +791,16 @@ impl App {
     }
 
     async fn run_command(&mut self, cmd: &str) {
+        if let Some(format) = cmd.strip_prefix("export ") {
+            self.status = match (&self.result, self.current_container()) {
+                (Some(res), Some(name)) => match crate::export::write(res, format.trim(), name) {
+                    Ok(path) => format!("exported {} rows to {}", res.rows.len(), path.display()),
+                    Err(e) => format!("error: {e:#}"),
+                },
+                _ => "error: open a table first".into(),
+            };
+            return;
+        }
         if cmd == "sort" || cmd.starts_with("sort ") {
             self.sort_command(&cmd[4..]);
             return;
@@ -1039,11 +1068,18 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
             }
+            KeyCode::Up | KeyCode::Down => self.recall(key.code == KeyCode::Up),
             KeyCode::Enter => {
                 let db = self.current_db().unwrap_or_default().to_string();
                 let container = self.current_container().unwrap_or_default().to_string();
                 let raw = self.query_input.value().to_string();
                 self.mode = Mode::Normal;
+                if let Some(conn) = self.conns.get(self.conn_idx) {
+                    let queries = self.history.entry(conn.name.clone()).or_default();
+                    crate::history::push(queries, &raw);
+                    // losing history isn't worth interrupting the query for
+                    let _ = crate::history::save(&self.history);
+                }
                 // a raw query may write, so it's never aborted
                 self.start("running query...", true, move |s| async move {
                     s.run_query(&db, &container, &raw).await.map(Done::Query)
@@ -1053,6 +1089,26 @@ impl App {
                 self.query_input.handle(key);
             }
         }
+    }
+
+    /// ↑ older / ↓ newer query of this connection into the prompt; past the newest,
+    /// back to an empty prompt.
+    fn recall(&mut self, older: bool) {
+        let Some(queries) = self
+            .conns
+            .get(self.conn_idx)
+            .and_then(|c| self.history.get(&c.name))
+            .filter(|q| !q.is_empty())
+        else {
+            return;
+        };
+        self.history_idx = match (self.history_idx, older) {
+            (None, true) => Some(queries.len() - 1),
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) if i + 1 < queries.len() => Some(i + 1),
+            (_, false) => None,
+        };
+        self.query_input = Input::new(self.history_idx.map_or("", |i| &queries[i]));
     }
 
     fn save_row(&mut self, original: &Row, edited: &Row) {
@@ -1113,6 +1169,23 @@ impl App {
             s.insert_row(&db, &container, &row)
                 .await
                 .map(|_| Done::Inserted)
+        });
+    }
+
+    /// Asks the backend, in the background, what the open confirm would run.
+    fn preview<F>(
+        &mut self,
+        op: impl FnOnce(Arc<dyn DataSource>, String, String) -> F + Send + 'static,
+    ) where
+        F: Future<Output = Result<Option<String>>> + Send + 'static,
+    {
+        self.confirm_preview = None;
+        let db = self.current_db().unwrap_or_default().to_string();
+        let container = self.current_container().unwrap_or_default().to_string();
+        let status = std::mem::take(&mut self.status);
+        self.start(&status, false, move |s| async move {
+            // a preview that fails (no primary key...) just isn't shown
+            Ok(Done::Preview(op(s, db, container).await.ok().flatten()))
         });
     }
 
@@ -1226,8 +1299,11 @@ impl App {
             self.status = "no changes".into();
             return;
         }
-        self.pending_edit = Some((original, edited));
+        self.pending_edit = Some((original.clone(), edited.clone()));
         self.mode = Mode::ConfirmEditSave;
+        self.preview(
+            move |s, db, c| async move { s.preview_update(&db, &c, &original, &edited).await },
+        );
     }
 
     async fn handle_confirm_edit_save_key(&mut self, key: KeyEvent) {
@@ -1541,6 +1617,9 @@ mod tests {
             self.inserted.lock().unwrap().push(row.clone());
             Ok(())
         }
+        async fn preview_delete(&self, _: &str, c: &str, _: &Row) -> Result<Option<String>> {
+            Ok(Some(format!("DELETE FROM {c} WHERE id = 1")))
+        }
         async fn describe(&self, _: &str, _: &str) -> Result<QueryResult> {
             Ok(QueryResult {
                 columns: vec!["column".into()],
@@ -1666,6 +1745,40 @@ mod tests {
             [serde_json::from_str::<Row>(r#"{"id": 7}"#).unwrap()]
         );
         assert!(app.status.starts_with("1 rows"), "reloaded: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_shows_the_statement() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        press(&mut app, KeyCode::Char('d')).await;
+        settle(&mut app).await;
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+        assert_eq!(
+            app.confirm_preview.as_deref(),
+            Some("DELETE FROM t WHERE id = 1")
+        );
+        press(&mut app, KeyCode::Char('n')).await;
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[tokio::test]
+    async fn up_and_down_walk_the_query_history() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        app.history
+            .insert("slow".into(), vec!["select 1".into(), "select 2".into()]);
+        press(&mut app, KeyCode::Char('/')).await;
+        let shown = |app: &App| app.query_input.value().to_string();
+        press(&mut app, KeyCode::Up).await;
+        assert_eq!(shown(&app), "select 2");
+        press(&mut app, KeyCode::Up).await;
+        press(&mut app, KeyCode::Up).await;
+        assert_eq!(shown(&app), "select 1");
+        press(&mut app, KeyCode::Down).await;
+        assert_eq!(shown(&app), "select 2");
+        press(&mut app, KeyCode::Down).await;
+        assert_eq!(shown(&app), "");
     }
 
     #[tokio::test]

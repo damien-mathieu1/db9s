@@ -83,6 +83,28 @@ pub trait DataSource: Send + Sync {
 
     async fn delete_row(&self, database: &str, container: &str, row: &Row) -> Result<()>;
 
+    /// The statement a delete of `row` would run, for the confirm prompt; None when the
+    /// backend has nothing clearer to show than "delete this row?".
+    async fn preview_delete(
+        &self,
+        _database: &str,
+        _container: &str,
+        _row: &Row,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Same for an update from `original` to `edited`.
+    async fn preview_update(
+        &self,
+        _database: &str,
+        _container: &str,
+        _original: &Row,
+        _edited: &Row,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Adds `row`; fields left out get the database's defaults (serial ids, `_id`...).
     async fn insert_row(&self, _database: &str, _container: &str, _row: &Row) -> Result<()> {
         Err(anyhow!("this backend can't insert rows"))
@@ -171,6 +193,27 @@ impl DataSource for ReadOnly {
 
     async fn insert_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
         Err(anyhow!("read-only connection: insert refused"))
+    }
+
+    async fn preview_delete(
+        &self,
+        database: &str,
+        container: &str,
+        row: &Row,
+    ) -> Result<Option<String>> {
+        self.0.preview_delete(database, container, row).await
+    }
+
+    async fn preview_update(
+        &self,
+        database: &str,
+        container: &str,
+        original: &Row,
+        edited: &Row,
+    ) -> Result<Option<String>> {
+        self.0
+            .preview_update(database, container, original, edited)
+            .await
     }
 
     async fn describe(&self, database: &str, container: &str) -> Result<QueryResult> {

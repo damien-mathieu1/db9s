@@ -73,6 +73,8 @@ async fn exercise(source: &dyn DataSource, db: &str, container: &str, query_for_
 
     let res = source.fetch_rows(db, container, 10, 0).await.unwrap();
     let row_b = res.rows.iter().find(|r| r["name"] == json!("b")).unwrap();
+    let shown = source.preview_delete(db, container, row_b).await.unwrap();
+    assert!(shown.is_some_and(|s| s.contains(container)));
     source.delete_row(db, container, row_b).await.unwrap();
 
     let res = source.fetch_rows(db, container, 10, 0).await.unwrap();

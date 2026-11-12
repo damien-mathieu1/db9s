@@ -175,6 +175,36 @@ impl DataSource for MongoSource {
         Ok(())
     }
 
+    async fn preview_delete(&self, _: &str, container: &str, row: &Row) -> Result<Option<String>> {
+        let id = row
+            .get("_id")
+            .ok_or_else(|| anyhow!("document has no _id"))?;
+        Ok(Some(format!("db.{container}.deleteOne({{\"_id\": {id}}})")))
+    }
+
+    /// Shows the fields that change; the update `$set`s the whole edited document, which
+    /// ends in the same state.
+    async fn preview_update(
+        &self,
+        _: &str,
+        container: &str,
+        original: &Row,
+        edited: &Row,
+    ) -> Result<Option<String>> {
+        let id = original
+            .get("_id")
+            .ok_or_else(|| anyhow!("document has no _id"))?;
+        let changed: Row = edited
+            .iter()
+            .filter(|(k, v)| original.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Ok(Some(format!(
+            "db.{container}.updateOne({{\"_id\": {id}}}, {{\"$set\": {}}})",
+            serde_json::Value::Object(changed)
+        )))
+    }
+
     async fn insert_row(&self, database: &str, container: &str, row: &Row) -> Result<()> {
         let coll = self
             .client
