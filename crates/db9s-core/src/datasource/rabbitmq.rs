@@ -98,6 +98,10 @@ impl DataSource for RabbitMqSource {
         Ok(Self::names(self.get(&["queues", vhost]).await?))
     }
 
+    async fn metrics(&self, vhost: &str, queue: &str) -> Result<Vec<(String, f64)>> {
+        Ok(queue_metrics(&self.get(&["queues", vhost, queue]).await?))
+    }
+
     // shortcut: the API can't skip messages, so offset fetches limit+offset and drops the head; fine for peeking
     async fn fetch_rows(
         &self,
@@ -171,5 +175,31 @@ impl DataSource for RabbitMqSource {
 
     async fn update_row(&self, _: &str, _: &str, _: &Row, _: &Row) -> Result<()> {
         Err(anyhow!("rabbitmq messages are read-only"))
+    }
+}
+
+/// The management API's queue object, as the numbers worth watching.
+fn queue_metrics(q: &Value) -> Vec<(String, f64)> {
+    let num = |v: &Value| v.as_f64().unwrap_or(0.);
+    vec![
+        ("ready".into(), num(&q["messages_ready"])),
+        ("unacked".into(), num(&q["messages_unacknowledged"])),
+        (
+            "publish/s".into(),
+            num(&q["message_stats"]["publish_details"]["rate"]),
+        ),
+        ("consumers".into(), num(&q["consumers"])),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn queue_metrics_default_missing_stats_to_zero() {
+        let q =
+            serde_json::json!({"messages_ready": 3, "messages_unacknowledged": 1, "consumers": 2});
+        let m = super::queue_metrics(&q);
+        assert_eq!(m[0], ("ready".to_string(), 3.));
+        assert_eq!(m[2], ("publish/s".to_string(), 0.));
     }
 }

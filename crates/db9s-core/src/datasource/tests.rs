@@ -235,6 +235,11 @@ async fn mongo_conformance() {
 /// paginate, read-only edit, purge. Expects `queue` to exist, empty, in vhost "/".
 async fn exercise_queue(source: &dyn DataSource, queue: &str) {
     assert!(source.is_queue());
+    let metrics = source.metrics("/", queue).await.unwrap();
+    assert!(
+        metrics.iter().any(|(name, _)| name == "ready"),
+        "{metrics:?}"
+    );
     assert!(source
         .list_databases()
         .await
@@ -371,6 +376,11 @@ async fn redis_conformance() {
         return;
     };
     let source = RedisSource::connect(&url).await.unwrap();
+    let metrics = source.metrics("db0", "").await.unwrap();
+    assert!(
+        metrics.iter().any(|(n, v)| n == "memory MB" && *v > 0.),
+        "{metrics:?}"
+    );
     let p = unique("db9s_test");
     let k = |t: &str| format!("{p}:{t}");
     let db = "db0";

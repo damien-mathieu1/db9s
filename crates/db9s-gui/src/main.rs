@@ -117,7 +117,8 @@ impl Db9s {
                 .timer(Duration::from_millis(100))
                 .await;
             let alive = this.update(cx, |this, cx| {
-                if this.app.is_busy() {
+                // browsing: keep polling so live metrics get sampled
+                if this.app.is_busy() || this.app.screen == Screen::Browse {
                     this.rt.block_on(this.app.poll());
                     cx.notify();
                 }
@@ -906,17 +907,14 @@ impl Db9s {
             Some(fe) => field_editor(fe, p),
             None => self.inspector(p, cx),
         };
-        let right = if containers_focused {
-            self.grid(false, p, cx)
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .min_h_0()
-                .child(self.grid(true, p, cx).flex_1().min_h_0())
-                .child(below.h_2_5())
-        };
+        let right = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_h_0()
+            .child(self.grid(!containers_focused, p, cx).flex_1().min_h_0())
+            .children((!containers_focused).then(|| below.h_2_5()))
+            .children(live_charts(app, p));
         div()
             .flex()
             .flex_row()
@@ -1465,6 +1463,61 @@ fn query_editor(app: &App, p: &Palette) -> Div {
         p,
     )
     .children(lines)
+}
+
+/// Sparklines of the open container's metrics (queue depth, Redis memory...), newest
+/// on the right; nothing for backends without metrics.
+fn live_charts(app: &App, p: &Palette) -> Option<Div> {
+    if app.metrics.is_empty() {
+        return None;
+    }
+    const HEIGHT: f32 = 36.;
+    let charts = app.metrics.iter().map(|(name, series)| {
+        let max = series.iter().cloned().fold(0., f64::max);
+        let last = series.back().copied().unwrap_or(0.);
+        let bars = series.iter().map(|v| {
+            let h = if max > 0. {
+                (v / max) as f32 * HEIGHT
+            } else {
+                0.
+            };
+            div().w(px(3.)).h(px(h.max(1.))).bg(p.border_focus)
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(line(vec![
+                styled(format!("{name} "), p.muted),
+                styled(format_metric(last), p.key_hint).bold(),
+            ]))
+            .child(
+                div()
+                    .h(px(HEIGHT))
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(1.))
+                    .children(bars),
+            )
+    });
+    Some(
+        pane(
+            format!("live  (every {}s)", db9s_core::app::METRICS_EVERY.as_secs()),
+            p.border_blur,
+            p,
+        )
+        .child(div().flex().flex_row().gap_6().children(charts)),
+    )
+}
+
+/// 3, 2.5, 1234 — no trailing zeros for counts, two decimals for rates and sizes.
+fn format_metric(v: f64) -> String {
+    if v.fract() == 0. {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.2}")
+    }
 }
 
 /// One line of the inspector tree.
@@ -2286,6 +2339,13 @@ mod tests {
             );
         });
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn formats_metrics() {
+        assert_eq!(format_metric(3.), "3");
+        assert_eq!(format_metric(2.5), "2.50");
+        assert_eq!(format_metric(0.), "0");
     }
 
     #[test]

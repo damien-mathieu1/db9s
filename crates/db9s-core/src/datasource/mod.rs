@@ -77,6 +77,12 @@ pub trait DataSource: Send + Sync {
         Ok(None)
     }
 
+    /// Live numbers for the container (queue depth, memory...), sampled every few
+    /// seconds while it's open and drawn as sparklines; empty when there's nothing to watch.
+    async fn metrics(&self, _database: &str, _container: &str) -> Result<Vec<(String, f64)>> {
+        Ok(vec![])
+    }
+
     /// Raw query: SQL for postgres, a mongo shell-ish JSON filter `{"find": ...}` not required —
     /// for mongo this runs an aggregation pipeline given as a JSON array string, or a plain
     /// filter document JSON for a `find`.
@@ -177,6 +183,10 @@ impl DataSource for ReadOnly {
 
     async fn count_rows(&self, database: &str, container: &str) -> Result<Option<u64>> {
         self.0.count_rows(database, container).await
+    }
+
+    async fn metrics(&self, database: &str, container: &str) -> Result<Vec<(String, f64)>> {
+        self.0.metrics(database, container).await
     }
 
     async fn run_query(&self, database: &str, container: &str, raw: &str) -> Result<QueryResult> {

@@ -4,14 +4,21 @@ use crate::input::Input;
 use crate::key::{KeyCode, KeyEvent};
 use crate::value::Row;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 pub const PAGE_SIZE: i64 = 200;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+/// How often the open container's metrics are sampled, and how many samples are kept.
+pub const METRICS_EVERY: Duration = Duration::from_secs(2);
+pub const METRICS_KEPT: usize = 60;
+
+/// One sample: (series name, value) per metric.
+type Metrics = Vec<(String, f64)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -136,6 +143,12 @@ pub struct App {
     pub total: Option<u64>,
     /// What `i` shows: one row per column of the current container.
     pub schema: Option<QueryResult>,
+    /// Live series for the open container (`DataSource::metrics`), oldest sample first.
+    pub metrics: Vec<(String, VecDeque<f64>)>,
+    /// Which (database, container) `metrics` belongs to.
+    metrics_for: Option<(String, String)>,
+    sampler: Option<JoinHandle<Result<Metrics>>>,
+    last_sample: Option<Instant>,
     /// The statement the open delete/save confirm would run, once the backend says.
     pub confirm_preview: Option<String>,
     history: crate::history::History,
@@ -308,6 +321,10 @@ impl App {
             total: None,
             schema: None,
             confirm_preview: None,
+            metrics: vec![],
+            metrics_for: None,
+            sampler: None,
+            last_sample: None,
             history: crate::history::load(),
             history_idx: None,
             query_input: Input::default(),
@@ -342,6 +359,7 @@ impl App {
     /// call); called once per event-loop tick so the UI never waits on the network.
     pub async fn poll(&mut self) {
         self.poll_connecting().await;
+        self.sample_metrics().await;
         if !self
             .pending
             .as_ref()
@@ -356,6 +374,60 @@ impl App {
             Err(e) if e.is_cancelled() => {}
             Err(e) => self.status = format!("error: database task panicked: {e}"),
         }
+    }
+
+    /// Keeps `metrics` sampling the open container every `METRICS_EVERY`, starting
+    /// over when another one opens. Runs beside `pending`, so it never cancels a read.
+    async fn sample_metrics(&mut self) {
+        if self.sampler.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Ok(Ok(values)) = self.sampler.take().unwrap().await {
+                for (name, v) in values {
+                    let series = match self.metrics.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, s)) => s,
+                        None => {
+                            self.metrics.push((name, VecDeque::new()));
+                            &mut self.metrics.last_mut().unwrap().1
+                        }
+                    };
+                    series.push_back(v);
+                    if series.len() > METRICS_KEPT {
+                        series.pop_front();
+                    }
+                }
+            }
+        }
+        let open = match (self.screen, self.current_db(), self.current_container()) {
+            (Screen::Browse, Some(db), Some(c)) => Some((db.to_string(), c.to_string())),
+            _ => None,
+        };
+        if open != self.metrics_for {
+            if let Some(h) = self.sampler.take() {
+                h.abort();
+            }
+            self.metrics.clear();
+            self.last_sample = None;
+            self.metrics_for = open.clone();
+        }
+        let Some((db, container)) = open else {
+            return;
+        };
+        let due = self
+            .last_sample
+            .is_none_or(|t| t.elapsed() >= METRICS_EVERY);
+        if self.sampler.is_some() || !due {
+            return;
+        }
+        let Some(source) = self
+            .conns
+            .get(self.conn_idx)
+            .and_then(|c| c.source.as_ref().ok().cloned())
+        else {
+            return;
+        };
+        self.last_sample = Some(Instant::now());
+        self.sampler = Some(tokio::spawn(async move {
+            source.metrics(&db, &container).await
+        }));
     }
 
     /// Whether something is still running in the background (to keep polling).
@@ -1621,6 +1693,9 @@ mod tests {
         async fn preview_delete(&self, _: &str, c: &str, _: &Row) -> Result<Option<String>> {
             Ok(Some(format!("DELETE FROM {c} WHERE id = 1")))
         }
+        async fn metrics(&self, _: &str, _: &str) -> Result<Vec<(String, f64)>> {
+            Ok(vec![("depth".into(), 3.)])
+        }
         async fn describe(&self, _: &str, _: &str) -> Result<QueryResult> {
             Ok(QueryResult {
                 columns: vec!["column".into()],
@@ -1780,6 +1855,25 @@ mod tests {
         assert_eq!(shown(&app), "select 2");
         press(&mut app, KeyCode::Down).await;
         assert_eq!(shown(&app), "");
+    }
+
+    #[tokio::test]
+    async fn metrics_are_sampled_for_the_open_container() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        for _ in 0..20 {
+            app.poll().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // sampled once (then every METRICS_EVERY), as a named series
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(app.metrics[0].0, "depth");
+        assert_eq!(app.metrics[0].1, [3.]);
+        // another screen: series dropped
+        press(&mut app, KeyCode::Esc).await;
+        press(&mut app, KeyCode::Esc).await;
+        app.poll().await;
+        assert!(app.metrics.is_empty());
     }
 
     #[tokio::test]
