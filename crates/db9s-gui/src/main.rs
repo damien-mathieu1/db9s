@@ -13,7 +13,9 @@ use std::time::Duration;
 
 const BG: u32 = 0x1a1b1e;
 const FG: u32 = 0xd4d4d4;
-const CARD_HEIGHT: f32 = 92.;
+const LINE_HEIGHT: f32 = 20.;
+/// 4 field lines + py_1 (8) + border (2) + pb_1 gap (4), with a little slack.
+const CARD_HEIGHT: f32 = 4. * LINE_HEIGHT + 18.;
 
 fn main() {
     let read_only = std::env::args().any(|a| a == "--read-only");
@@ -367,6 +369,7 @@ impl Render for Db9s {
             .text_color(rgb(FG))
             .font_family("Menlo")
             .text_sm()
+            .line_height(px(LINE_HEIGHT))
             .child(header(app, &p));
         if matches!(app.mode, Mode::Command) {
             root = root.child(command_prompt(app, &p));
