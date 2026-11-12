@@ -228,7 +228,7 @@ key_hint     = "#ebcb8b"   # keys in the footer
 muted        = "#616e88"   # descriptions, urls, hints
 ```
 
-The built-ins are in [`src/themes/`](src/themes) if you want a full example.
+The built-ins are in [`crates/db9s-core/src/themes/`](crates/db9s-core/src/themes) if you want a full example.
 A typo in a key or an invalid color shows an error and keeps the current theme.
 
 ## Notes

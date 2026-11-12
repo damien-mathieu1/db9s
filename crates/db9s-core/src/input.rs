@@ -1,7 +1,5 @@
 //! Single-line text input with a movable cursor, shared by every text field.
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Span;
+use crate::key::{KeyCode, KeyEvent};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Input {
@@ -32,7 +30,7 @@ impl Input {
     /// Applies an editing key. Returns false for keys it doesn't use (enter, esc, tab...).
     pub fn handle(&mut self, key: KeyEvent) -> bool {
         let len = self.value.chars().count();
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.ctrl;
         match key.code {
             KeyCode::Char('a') if ctrl => self.cursor = 0,
             KeyCode::Char('e') if ctrl => self.cursor = len,
@@ -68,19 +66,13 @@ impl Input {
         true
     }
 
-    /// The text, with the cursor drawn as a reversed cell when focused.
-    pub fn spans(&self, focused: bool) -> Vec<Span<'static>> {
-        if !focused {
-            return vec![Span::raw(self.value.clone())];
-        }
+    /// The text before the cursor, the char under it (None at the end), and the rest,
+    /// so a frontend can draw the cursor however it likes.
+    pub fn split_at_cursor(&self) -> (&str, Option<char>, &str) {
         let b = self.byte_at(self.cursor);
         let mut rest = self.value[b..].chars();
-        let at = rest.next().map_or(" ".to_string(), String::from);
-        vec![
-            Span::raw(self.value[..b].to_string()),
-            Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)),
-            Span::raw(rest.as_str().to_string()),
-        ]
+        let at = rest.next();
+        (&self.value[..b], at, rest.as_str())
     }
 }
 
@@ -89,7 +81,7 @@ mod tests {
     use super::*;
 
     fn press(input: &mut Input, code: KeyCode) {
-        input.handle(KeyEvent::new(code, KeyModifiers::NONE));
+        input.handle(KeyEvent::new(code));
     }
 
     #[test]
@@ -109,8 +101,12 @@ mod tests {
         press(&mut i, KeyCode::Right);
         press(&mut i, KeyCode::Char('!'));
         assert_eq!(i.value(), "élo!");
-        assert!(!i.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        assert!(!i.handle(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        assert!(!i.handle(KeyEvent::new(KeyCode::Enter)));
+        assert!(!i.handle(KeyEvent::ctrl(KeyCode::Char('s'))));
+        assert_eq!(i.split_at_cursor(), ("élo!", None, ""));
+        press(&mut i, KeyCode::Left);
+        press(&mut i, KeyCode::Left);
+        assert_eq!(i.split_at_cursor(), ("él", Some('o'), "!"));
         assert_eq!(i.value(), "élo!");
     }
 }

@@ -61,7 +61,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+
+  # GPUI is out of default-members (slow, system libs on Linux); macOS builds it
+  # with no extra setup thanks to runtime_shaders.
+  gui:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p db9s-gui --all-targets -- -D warnings
+      - run: cargo test -p db9s-gui

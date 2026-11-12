@@ -2,11 +2,8 @@
 //! binary (src/themes/*.toml); users add or override them in `<config dir>/themes/<name>.toml`,
 //! optionally `inherits = "<other theme>"` so they only redefine what they change.
 use anyhow::{anyhow, bail, Context, Result};
-use ratatui::style::Color;
-use ratatui::widgets::BorderType;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{LazyLock, RwLock};
 
 const BUILTIN: [(&str, &str); 6] = [
@@ -20,6 +17,86 @@ const BUILTIN: [(&str, &str); 6] = [
     ("nord", include_str!("themes/nord.toml")),
     ("tokyo-night", include_str!("themes/tokyo-night.toml")),
 ];
+
+/// Same variants as ratatui's `Color`, so the TUI maps 1:1; a GUI maps the 16 names
+/// to its own ANSI palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Reset,
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    Gray,
+    DarkGray,
+    LightRed,
+    LightGreen,
+    LightYellow,
+    LightBlue,
+    LightMagenta,
+    LightCyan,
+    White,
+    Rgb(u8, u8, u8),
+    Indexed(u8),
+}
+
+impl Color {
+    /// Accepts what ratatui's `Color::from_str` accepts: a name ("red", "bright-blue",
+    /// "grey"...), an ANSI index ("67") or "#rrggbb".
+    pub fn parse(s: &str) -> Option<Self> {
+        let name = s
+            .to_lowercase()
+            .replace([' ', '-', '_'], "")
+            .replace("bright", "light")
+            .replace("grey", "gray")
+            .replace("silver", "gray")
+            .replace("lightblack", "darkgray")
+            .replace("lightwhite", "white")
+            .replace("lightgray", "white");
+        Some(match name.as_str() {
+            "reset" => Self::Reset,
+            "black" => Self::Black,
+            "red" => Self::Red,
+            "green" => Self::Green,
+            "yellow" => Self::Yellow,
+            "blue" => Self::Blue,
+            "magenta" => Self::Magenta,
+            "cyan" => Self::Cyan,
+            "gray" => Self::Gray,
+            "darkgray" => Self::DarkGray,
+            "lightred" => Self::LightRed,
+            "lightgreen" => Self::LightGreen,
+            "lightyellow" => Self::LightYellow,
+            "lightblue" => Self::LightBlue,
+            "lightmagenta" => Self::LightMagenta,
+            "lightcyan" => Self::LightCyan,
+            "white" => Self::White,
+            _ => {
+                if let Ok(i) = s.parse::<u8>() {
+                    Self::Indexed(i)
+                } else {
+                    let hex = s.strip_prefix('#')?;
+                    if hex.len() != 6 {
+                        return None;
+                    }
+                    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+                    Self::Rgb(byte(0)?, byte(2)?, byte(4)?)
+                }
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderType {
+    Plain,
+    Rounded,
+    Double,
+    Thick,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
@@ -179,7 +256,7 @@ fn apply(mut t: Theme, file: &ThemeFile) -> Result<Theme> {
     ];
     for (key, value, slot) in fields {
         if let Some(v) = value {
-            *slot = Color::from_str(v).map_err(|_| {
+            *slot = Color::parse(v).ok_or_else(|| {
                 anyhow!("colors.{key}: '{v}' is not a color (use \"#rrggbb\", an ANSI index like \"67\", or a name like \"red\")")
             })?;
         }
@@ -225,6 +302,18 @@ mod tests {
         let t = parse("[colors]\nmuted = \"#010203\"").unwrap();
         assert_eq!(t.muted, Color::Rgb(1, 2, 3));
         assert_eq!(t.error, load("default").unwrap().error);
+    }
+
+    #[test]
+    fn parses_colors_like_ratatui() {
+        assert_eq!(Color::parse("Bright-Blue"), Some(Color::LightBlue));
+        assert_eq!(Color::parse("grey"), Some(Color::Gray));
+        assert_eq!(Color::parse("light gray"), Some(Color::White));
+        assert_eq!(Color::parse("67"), Some(Color::Indexed(67)));
+        assert_eq!(Color::parse("#A0b1C2"), Some(Color::Rgb(0xa0, 0xb1, 0xc2)));
+        for bad in ["#12345", "#gggggg", "256", "blu", "#1234567", "#éé1234"] {
+            assert_eq!(Color::parse(bad), None, "{bad}");
+        }
     }
 
     #[test]

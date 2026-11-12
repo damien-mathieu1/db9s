@@ -53,11 +53,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # crates.io publishes the version in Cargo.toml, so it must match the tag.
+      # Bumps [workspace.package] (shared by db9s and db9s-core) and the exact db9s-core pin.
       - name: Bump Cargo version, commit and tag
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           sed -i "0,/^version = .*/s//version = \"${VERSION#v}\"/" Cargo.toml
+          sed -i -E "s/^(db9s-core = .*version = \"=)[^\"]*/\1${VERSION#v}/" Cargo.toml
           cargo update --workspace
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -112,7 +114,8 @@ jobs:
           ref: ${{ needs.create-release.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish
-        run: cargo publish --locked
+        # publishes db9s-core first, then db9s (multi -p needs cargo >= 1.90); db9s-gui is not published
+        run: cargo publish --locked -p db9s-core -p db9s
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
