@@ -4,7 +4,7 @@ members = ["crates/db9s-core", "crates/db9s-gui"]
 default-members = [".", "crates/db9s-core"]
 
 [workspace.package]
-version = "2026.11.3"
+version = "2026.11.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/damien-mathieu1/db9s"
@@ -23,7 +23,7 @@ exclude = ["dev/", "docker-compose.yml", ".github/"]
 
 [dependencies]
 # exact pin: both crates are always released together, at the same version
-db9s-core = { path = "crates/db9s-core", version = "=2026.11.3" }
+db9s-core = { path = "crates/db9s-core", version = "=2026.11.4" }
 ratatui = "0.29"
 crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }

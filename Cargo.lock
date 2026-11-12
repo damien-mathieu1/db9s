@@ -1837,7 +1837,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "db9s"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "db9s-core"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "db9s-gui"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "db9s-core",
  "gpui",
