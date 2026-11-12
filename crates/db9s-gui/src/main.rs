@@ -448,16 +448,22 @@ impl Db9s {
             &self.container_scroll,
             p,
         ));
-        let right = match &app.field_edit {
+        // the row being edited shows in the grid; the panel below lists every field,
+        // including ones the grid has no column for
+        let below = match &app.field_edit {
             Some(fe) => field_editor(fe, p),
-            None if containers_focused => self.grid(false, p, cx),
-            None => div()
+            None => self.inspector(p, cx),
+        };
+        let right = if containers_focused {
+            self.grid(false, p, cx)
+        } else {
+            div()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .min_h_0()
                 .child(self.grid(true, p, cx).flex_1().min_h_0())
-                .child(self.inspector(p, cx).h_2_5()),
+                .child(below.h_2_5())
         };
         div()
             .flex()
@@ -575,8 +581,33 @@ impl Db9s {
                 range
                     .filter_map(|i| Some((i, res.rows.get(i)?)))
                     .map(|(i, row)| {
+                        // the selected row, while field-edited, shows its pending values
+                        let fe = app.field_edit.as_ref().filter(|_| selected == Some(i));
+                        let row = fe.map_or(row, |fe| &fe.edited);
+                        let current = fe.and_then(|fe| fe.edited.keys().nth(fe.idx));
                         let cells = res.columns.iter().zip(widths.iter()).map(|(col, w)| {
                             let cell = div().flex_shrink_0().w(px(*w)).px_1().truncate();
+                            let cell = match fe {
+                                Some(fe) if fe.original.get(col) != fe.edited.get(col) => {
+                                    cell.text_color(p.success)
+                                }
+                                _ => cell,
+                            };
+                            if let Some(fe) = fe.filter(|_| current == Some(col)) {
+                                let content = match &fe.input {
+                                    Some(input) => line(input_spans(input, true)),
+                                    None => line(vec![raw(row
+                                        .get(col)
+                                        .map(compact)
+                                        .unwrap_or_default())]),
+                                };
+                                // no border: uniform_list needs every row the same height
+                                return cell
+                                    .bg(rgb(BG))
+                                    .text_color(p.border_focus)
+                                    .debug_selector(|| format!("cell-edit-{col}"))
+                                    .child(content);
+                            }
                             match row.get(col) {
                                 None | Some(serde_json::Value::Null) => {
                                     cell.text_color(p.muted).child("null")
@@ -1313,6 +1344,44 @@ mod tests {
         cx.simulate_click(settings.center(), Default::default());
         cx.run_until_parked();
         view.read_with(cx, |v, _| assert!(matches!(v.app.mode, Mode::Settings)));
+    }
+
+    /// `e` then enter edits the selected row's field right in the grid.
+    #[gpui::test]
+    fn field_edit_happens_in_the_grid(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![serde_json::from_str(r#"{"id": 1, "name": "Mouse"}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        view.update(cx, |v, cx| {
+            for k in [
+                KeyCode::Char('e'),
+                KeyCode::Char('j'),
+                KeyCode::Enter,
+                KeyCode::Char('X'),
+            ] {
+                v.rt.block_on(v.app.handle_key(KeyEvent::new(k)));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("cell-edit-name").is_some(),
+            "name cell is in edit"
+        );
+        assert!(cx.debug_bounds("cell-edit-id").is_none());
+        view.update(cx, |v, _| {
+            v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Enter)));
+            let fe = v.app.field_edit.as_ref().unwrap();
+            assert_eq!(fe.edited["name"], "MouseX");
+        });
     }
 
     #[test]
