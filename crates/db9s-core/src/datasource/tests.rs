@@ -97,6 +97,46 @@ async fn exercise(source: &dyn DataSource, db: &str, container: &str, query_for_
     );
 }
 
+/// Needs no server: a throwaway file, so it always runs.
+#[tokio::test]
+async fn sqlite_conformance() {
+    use super::sqlite::SqliteSource;
+    let path = std::env::temp_dir().join(format!("{}.db", unique("db9s_test")));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let table = "items";
+    {
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!("INSERT INTO {table} (name) VALUES ('a'), ('b')"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let source = SqliteSource::connect(&url, false).await.unwrap();
+    let query = format!("SELECT * FROM {table} WHERE name = 'z'");
+    exercise(&source, "main", table, &query).await;
+
+    let schema = source.describe("main", table).await.unwrap();
+    let id = schema
+        .rows
+        .iter()
+        .find(|r| r["column"] == json!("id"))
+        .unwrap();
+    assert_eq!(id["key"], json!("PK"));
+    assert_eq!(id["type"], json!("INTEGER"));
+
+    // read-only is enforced by SQLite itself, raw queries included
+    let ro = SqliteSource::connect(&url, true).await.unwrap();
+    let write = format!("DELETE FROM {table}");
+    assert!(ro.run_query("main", table, &write).await.is_err());
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn postgres_conformance() {
     let Ok(url) = std::env::var("DB9S_TEST_POSTGRES_URL") else {

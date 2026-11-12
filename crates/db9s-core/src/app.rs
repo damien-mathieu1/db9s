@@ -182,7 +182,7 @@ async fn connect(kind: Kind, url: &str, read_only: bool) -> Result<Box<dyn DataS
     let url = &crate::secrets::resolve(url).await?;
     use crate::datasource::{
         amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
-        rabbitmq::RabbitMqSource, redis::RedisSource,
+        rabbitmq::RabbitMqSource, redis::RedisSource, sqlite::SqliteSource,
     };
     let fut = async {
         Ok(match kind {
@@ -194,6 +194,7 @@ async fn connect(kind: Kind, url: &str, read_only: bool) -> Result<Box<dyn DataS
             Kind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
             Kind::Redis => Box::new(RedisSource::connect(url).await?),
             Kind::MySql => Box::new(MySqlSource::connect(url, read_only).await?),
+            Kind::Sqlite => Box::new(SqliteSource::connect(url, read_only).await?),
         })
     };
     let source = tokio::time::timeout(CONNECT_TIMEOUT, fut)

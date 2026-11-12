@@ -5,6 +5,7 @@ pub mod postgres;
 pub mod rabbitmq;
 pub mod redis;
 pub mod sql;
+pub mod sqlite;
 #[cfg(test)]
 mod tests;
 
