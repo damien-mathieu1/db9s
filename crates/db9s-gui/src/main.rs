@@ -9,7 +9,7 @@ use gpui::{
     ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, WindowBounds,
     WindowOptions,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -57,6 +57,10 @@ struct Db9s {
     col_widths: HashMap<String, f32>,
     /// Column being resized: (name, mouse x and column width when the drag started).
     resizing: Option<(String, f32, f32)>,
+    /// Inspector nodes unfolded by a click, by path (everything starts folded).
+    /// Kept across rows, so the same field stays open while moving through a table.
+    unfolded: HashSet<String>,
+    tree_scroll: UniformListScrollHandle,
     _poll: Task<()>,
 }
 
@@ -87,6 +91,8 @@ impl Db9s {
             row_scroll: Default::default(),
             col_widths: HashMap::new(),
             resizing: None,
+            unfolded: HashSet::new(),
+            tree_scroll: Default::default(),
             _poll: poll,
         }
     }
@@ -441,7 +447,14 @@ impl Db9s {
         ));
         let right = match &app.field_edit {
             Some(fe) => field_editor(fe, p),
-            None => self.grid(!containers_focused, p, cx),
+            None if containers_focused => self.grid(false, p, cx),
+            None => div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .min_h_0()
+                .child(self.grid(true, p, cx).flex_1().min_h_0())
+                .child(self.inspector(p, cx).h_2_5()),
         };
         div()
             .flex()
@@ -610,6 +623,63 @@ impl Db9s {
         )
     }
 
+    /// The selected row as a foldable JSON tree; click an object/array line to (un)fold it.
+    fn inspector(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let outer = pane("inspect  (click ▸ to unfold)", p.border_blur, p);
+        let Some(row) = self
+            .app
+            .result
+            .as_ref()
+            .and_then(|r| r.rows.get(self.app.row_idx))
+        else {
+            return outer;
+        };
+        let lines = Rc::new(flatten(row, &self.unfolded));
+        outer.child(
+            uniform_list(
+                "inspect",
+                lines.len(),
+                cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                    let p = palette();
+                    range
+                        .map(|i| {
+                            let l = &lines[i];
+                            let mut spans = vec![raw("  ".repeat(l.depth))];
+                            if let Some((open, _)) = &l.fold {
+                                spans.push(styled(if *open { "▾ " } else { "▸ " }, p.muted));
+                            }
+                            if let Some(k) = &l.key {
+                                spans.push(styled(format!("{k}: "), p.field_name).bold());
+                            }
+                            spans.push(match &l.leaf {
+                                Some(v) => leaf_span(v, &p),
+                                None => styled(l.summary.clone(), p.muted),
+                            });
+                            let key = l.key.clone().unwrap_or_default();
+                            let d = line(spans).id(i).debug_selector(|| format!("tree-{key}"));
+                            match &l.fold {
+                                Some((_, path)) => {
+                                    let path = path.clone();
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if !this.unfolded.remove(&path) {
+                                                this.unfolded.insert(path.clone());
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                }
+                                None => d,
+                            }
+                        })
+                        .collect()
+                }),
+            )
+            .track_scroll(self.tree_scroll.clone())
+            .flex_1(),
+        )
+    }
+
     fn on_resize_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some((col, x0, w0)) = &self.resizing else {
             return;
@@ -622,6 +692,94 @@ impl Db9s {
         let w = (w0 + f32::from(ev.position.x) - x0).max(MIN_COL_WIDTH);
         self.col_widths.insert(col.clone(), w);
         cx.notify();
+    }
+}
+
+/// One line of the inspector tree.
+#[derive(Debug, PartialEq)]
+struct TreeLine {
+    depth: usize,
+    /// Field name or array index.
+    key: Option<String>,
+    /// Scalars only.
+    leaf: Option<serde_json::Value>,
+    /// Objects/arrays: whether shown unfolded, and the path that toggles it.
+    fold: Option<(bool, String)>,
+    /// What a folded or empty container shows, e.g. `{3 fields}` / `[]`.
+    summary: String,
+}
+
+/// Flattens a row into visible tree lines; objects/arrays show their content only when
+/// their path (`/key/0/key`) is in `unfolded`.
+fn flatten(row: &db9s_core::value::Row, unfolded: &HashSet<String>) -> Vec<TreeLine> {
+    fn walk(
+        key: String,
+        v: &serde_json::Value,
+        path: String,
+        depth: usize,
+        unfolded: &HashSet<String>,
+        out: &mut Vec<TreeLine>,
+    ) {
+        use serde_json::Value;
+        let children: Vec<(String, &Value)> = match v {
+            Value::Object(m) => m.iter().map(|(k, v)| (k.clone(), v)).collect(),
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v))
+                .collect(),
+            _ => {
+                out.push(TreeLine {
+                    depth,
+                    key: Some(key),
+                    leaf: Some(v.clone()),
+                    fold: None,
+                    summary: String::new(),
+                });
+                return;
+            }
+        };
+        let (open_c, close_c, unit) = if v.is_object() {
+            ('{', '}', "field")
+        } else {
+            ('[', ']', "item")
+        };
+        let plural = if children.len() == 1 { "" } else { "s" };
+        let open = !children.is_empty() && unfolded.contains(&path);
+        let summary = if children.is_empty() {
+            format!("{open_c}{close_c}")
+        } else if open {
+            open_c.to_string()
+        } else {
+            format!("{open_c}{} {unit}{plural}{close_c}", children.len())
+        };
+        out.push(TreeLine {
+            depth,
+            key: Some(key),
+            leaf: None,
+            fold: (!children.is_empty()).then(|| (open, path.clone())),
+            summary,
+        });
+        if open {
+            for (k, child) in children {
+                let child_path = format!("{path}/{k}");
+                walk(k, child, child_path, depth + 1, unfolded, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    for (k, v) in row {
+        walk(k.clone(), v, format!("/{k}"), 0, unfolded, &mut out);
+    }
+    out
+}
+
+fn leaf_span(v: &serde_json::Value, p: &Palette) -> Span {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => styled(format!("{s:?}"), p.success),
+        Value::Number(n) => styled(n.to_string(), p.key_hint),
+        other => styled(other.to_string(), p.muted),
     }
 }
 
@@ -1004,6 +1162,65 @@ mod tests {
         assert_eq!(
             auto_width("a_long_column_name", &[]),
             18. * CHAR_WIDTH + 16.
+        );
+    }
+
+    #[test]
+    fn tree_starts_folded_and_unfolds_by_path() {
+        let row: db9s_core::value::Row = serde_json::from_str(
+            r#"{"id": 7, "tags": [], "addr": {"city": "Lyon", "geo": {"lat": 45.7}}}"#,
+        )
+        .unwrap();
+        let show = |unfolded: &[&str]| -> Vec<String> {
+            let u = unfolded.iter().map(|s| s.to_string()).collect();
+            flatten(&row, &u)
+                .into_iter()
+                .map(|l| {
+                    let v = l.leaf.map(|v| v.to_string()).unwrap_or(l.summary);
+                    format!("{}{}={v}", " ".repeat(l.depth), l.key.unwrap_or_default())
+                })
+                .collect()
+        };
+        assert_eq!(show(&[]), ["id=7", "tags=[]", "addr={2 fields}"]);
+        assert_eq!(
+            show(&["/addr"]),
+            [
+                "id=7",
+                "tags=[]",
+                "addr={",
+                " city=\"Lyon\"",
+                " geo={1 field}"
+            ]
+        );
+        // a child stays unfolded under a folded parent, and shows again with it
+        assert_eq!(show(&["/addr/geo"]), ["id=7", "tags=[]", "addr={2 fields}"]);
+        assert_eq!(show(&["/addr", "/addr/geo"]).last().unwrap(), "  lat=45.7");
+    }
+
+    /// Clicking a folded line in the rendered inspector unfolds it.
+    #[gpui::test]
+    fn clicking_a_tree_line_unfolds_it(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["name".into(), "tags".into()],
+            rows: vec![serde_json::from_str(r#"{"name": "Mouse", "tags": ["a", "b"]}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("tree-tags").expect("tags line is rendered");
+        cx.simulate_click(bounds.center(), Default::default());
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert!(v.unfolded.contains("/tags"), "click reached the line")
+        });
+        assert!(
+            cx.debug_bounds("tree-0").is_some(),
+            "unfolded items are rendered"
         );
     }
 

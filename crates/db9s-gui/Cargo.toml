@@ -13,3 +13,6 @@ db9s-core = { path = "../db9s-core" }
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
