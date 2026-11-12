@@ -393,6 +393,9 @@ impl Render for Db9s {
             .child(header(app, &p));
         if matches!(app.mode, Mode::Command) {
             root = root.child(command_prompt(app, &p));
+            if let Some(list) = self.command_palette(&p, cx) {
+                root = root.child(list);
+            }
         }
         let body = match app.screen {
             Screen::Connections => connections(app, &self.conn_scroll, &p).into_any_element(),
@@ -677,6 +680,55 @@ impl Db9s {
             )
             .track_scroll(self.tree_scroll.clone())
             .flex_1(),
+        )
+    }
+
+    /// Every `:` match under the command bar, the current one highlighted (↑/↓ move,
+    /// tab completes, enter runs what's typed, as in the TUI); a click runs that match.
+    fn command_palette(&self, p: &Palette, cx: &mut Context<Self>) -> Option<Div> {
+        const SHOWN: usize = 8;
+        let matches = self.app.command_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let sel = self.app.command_idx % matches.len();
+        let start = sel.saturating_sub(SHOWN - 1);
+        let typed = self.app.command_input.value().chars().count();
+        let items = matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(SHOWN)
+            .map(|(i, m)| {
+                let head: String = m.chars().take(typed).collect();
+                let tail: String = m.chars().skip(typed).collect();
+                let row = line(vec![raw(head).bold(), styled(tail, p.muted)])
+                    .px_1()
+                    .id(i)
+                    .debug_selector(|| format!("palette-{m}"))
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let m = m.clone();
+                        move |this, _, _, cx| {
+                            this.app.command_input = Input::new(m.clone());
+                            this.rt
+                                .block_on(this.app.handle_key(KeyEvent::new(KeyCode::Enter)));
+                            cx.notify();
+                        }
+                    }));
+                if i == sel {
+                    row.text_color(p.selected_fg).bg(p.selected_bg)
+                } else {
+                    row
+                }
+            });
+        let more = matches.len().saturating_sub(start + SHOWN);
+        Some(
+            pane(format!("{} matches", matches.len()), p.border_blur, p)
+                .children(items)
+                .children(
+                    (more > 0).then(|| line(vec![styled(format!("… {more} more"), p.muted)])),
+                ),
         )
     }
 
@@ -1222,6 +1274,45 @@ mod tests {
             cx.debug_bounds("tree-0").is_some(),
             "unfolded items are rendered"
         );
+    }
+
+    /// Typing in `:` lists every match; ↓ moves the highlight; clicking one runs it.
+    /// (clicks `settings`, which only opens a popup: `theme ..` would write config.toml)
+    #[gpui::test]
+    fn command_palette_lists_and_runs_matches(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.mode = Mode::Normal; // no connections opens the add-connection form
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let typing = |text: &str| {
+            let keys: Vec<KeyEvent> = text
+                .chars()
+                .map(|c| KeyEvent::new(KeyCode::Char(c)))
+                .collect();
+            move |v: &mut Db9s, cx: &mut Context<Db9s>| {
+                for k in &keys {
+                    v.rt.block_on(v.app.handle_key(*k));
+                }
+                cx.notify();
+            }
+        };
+        view.update(cx, typing(":th"));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("palette-theme default").is_some());
+        assert!(cx.debug_bounds("palette-theme nord").is_some());
+        view.update(cx, |v, _| {
+            v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Down)));
+            assert_eq!(v.app.command_idx, 1);
+            v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Esc)));
+        });
+        view.update(cx, typing(":se"));
+        cx.run_until_parked();
+        let settings = cx
+            .debug_bounds("palette-settings")
+            .expect("settings is listed");
+        cx.simulate_click(settings.center(), Default::default());
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(matches!(v.app.mode, Mode::Settings)));
     }
 
     #[test]
