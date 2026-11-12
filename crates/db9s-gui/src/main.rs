@@ -8,12 +8,13 @@ use db9s_core::key::{KeyCode, KeyEvent};
 use db9s_core::theme::{self, BorderType, Color};
 use gpui::{
     div, point, prelude::*, px, rgb, size, uniform_list, Application, Bounds, ClipboardItem,
-    Context, CursorStyle, Div, FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton,
+    Context, CursorStyle, Div, Entity, FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, MouseMoveEvent, ScrollHandle, ScrollStrategy, SharedString, Task,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const BG: u32 = 0x1a1b1e;
@@ -46,14 +47,23 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| Db9s::new(app, rt, saved, cx));
-                window.focus(&view.read(cx).focus);
-                let weak = view.downgrade();
+                let handle = rt.handle().clone();
+                let first = cx.new(|cx| Db9s::new(app, handle, saved, cx));
+                let ws = cx.new(|_| Workspace {
+                    rt,
+                    tabs: vec![],
+                    focus: vec![],
+                    active: 0,
+                    split: None,
+                });
+                ws.update(cx, |ws, cx| ws.add(first, window, cx));
+                let weak = ws.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
-                    weak.update(cx, |v, _| v.save_state()).ok();
+                    weak.update(cx, |ws, cx| ws.tabs[ws.active].read(cx).save_state())
+                        .ok();
                     true
                 });
-                view
+                ws
             },
         )
         .unwrap();
@@ -63,7 +73,9 @@ fn main() {
 
 struct Db9s {
     app: App,
-    rt: tokio::runtime::Runtime,
+    rt: tokio::runtime::Handle,
+    /// The tab bar this view lives in; None alone (tests).
+    workspace: Option<WeakEntity<Workspace>>,
     focus: FocusHandle,
     conn_scroll: UniformListScrollHandle,
     db_scroll: UniformListScrollHandle,
@@ -94,7 +106,7 @@ struct Db9s {
 impl Db9s {
     fn new(
         app: App,
-        rt: tokio::runtime::Runtime,
+        rt: tokio::runtime::Handle,
         saved: state::GuiState,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -138,6 +150,7 @@ impl Db9s {
             db_scroll: Default::default(),
             container_scroll: Default::default(),
             row_scroll: Default::default(),
+            workspace: None,
             col_widths: saved.col_widths,
             resizing: None,
             unfolded: HashSet::new(),
@@ -151,10 +164,15 @@ impl Db9s {
         }
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         if k.modifiers.platform {
             match k.key.as_str() {
+                "t" | "w" | "\\" | "[" | "]" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8"
+                | "9" => {
+                    let key = k.key.clone();
+                    self.tab_key(&key, window, cx);
+                }
                 "q" => self.quit(cx),
                 "c" => self.copy(k.modifiers.shift, cx),
                 "=" | "+" => self.zoom = (self.zoom + 0.1).min(ZOOMS.1),
@@ -174,9 +192,93 @@ impl Db9s {
             self.open_editor(req);
         }
         if self.app.should_quit {
-            self.quit(cx);
+            // q in one of several tabs closes that tab, in the last one quits
+            let tabs = self
+                .workspace
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|w| w.read(cx).tabs.len());
+            if tabs.unwrap_or(1) > 1 {
+                self.app.should_quit = false;
+                self.tab_key("w", window, cx);
+            } else {
+                self.quit(cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Cmd-T new tab, Cmd-W close it, Cmd-1..9 / Cmd-[ ] switch, Cmd-\ split.
+    fn tab_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.workspace.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let me = cx.entity_id();
+        let template = (key == "t" || key == "\\").then(|| self.new_tab_app());
+        ws.update(cx, |ws, cx| match key {
+            "t" => {
+                let tab = cx.new(|cx| {
+                    Db9s::new(template.unwrap(), ws.rt.handle().clone(), state::load(), cx)
+                });
+                ws.add(tab, window, cx);
+            }
+            "\\" => ws.toggle_split(template.unwrap(), window, cx),
+            "w" => ws.close(me, window, cx),
+            "[" => ws.activate((ws.active + ws.tabs.len() - 1) % ws.tabs.len(), window, cx),
+            "]" => ws.activate((ws.active + 1) % ws.tabs.len(), window, cx),
+            n => {
+                let i = n.parse::<usize>().unwrap_or(1) - 1;
+                if i < ws.tabs.len() {
+                    ws.activate(i, window, cx);
+                }
+            }
+        });
+    }
+
+    /// A fresh `App` for a new tab, on the connections this one already has open.
+    fn new_tab_app(&self) -> App {
+        let mut cfg = db9s_core::config::load().unwrap_or_default();
+        cfg.connections.clear();
+        let mut app = self.rt.block_on(App::new(cfg, self.app.force_read_only));
+        app.conns = self
+            .app
+            .conns
+            .iter()
+            .map(|c| db9s_core::app::ConnEntry {
+                name: c.name.clone(),
+                kind: c.kind,
+                url: c.url.clone(),
+                read_only: c.read_only,
+                source: c
+                    .source
+                    .as_ref()
+                    .map(Arc::clone)
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+            })
+            .collect();
+        app.mode = if app.conns.is_empty() {
+            Mode::AddConnection
+        } else {
+            Mode::Normal
+        };
+        app
+    }
+
+    /// The tab label: connection, then database and container once open.
+    fn title(&self) -> String {
+        let a = &self.app;
+        let conn = a.conns.get(a.conn_idx).map_or("db9s", |c| c.name.as_str());
+        match a.screen {
+            Screen::Connections => "connections".into(),
+            Screen::Databases => conn.into(),
+            Screen::Browse => format!(
+                "{conn} › {}",
+                a.containers
+                    .get(a.container_idx)
+                    .cloned()
+                    .unwrap_or_default()
+            ),
+        }
     }
 
     fn save_state(&self) {
@@ -510,6 +612,155 @@ fn compact(v: &serde_json::Value) -> String {
     }
 }
 
+/// The window: a tab bar over one tab, or two side by side (Cmd-\\).
+struct Workspace {
+    /// Owned here so it lives as long as the window; tabs get a handle.
+    rt: tokio::runtime::Runtime,
+    tabs: Vec<Entity<Db9s>>,
+    /// Each tab's focus, kept here: a tab asking to switch is mid-update, so the
+    /// workspace can't read it then.
+    focus: Vec<FocusHandle>,
+    active: usize,
+    /// The tab shown right of the active one.
+    split: Option<usize>,
+}
+
+impl Workspace {
+    fn add(&mut self, tab: Entity<Db9s>, window: &mut Window, cx: &mut Context<Self>) {
+        let me = cx.entity().downgrade();
+        let focus = tab.update(cx, |t, _| {
+            t.workspace = Some(me);
+            t.focus.clone()
+        });
+        self.tabs.push(tab);
+        self.focus.push(focus);
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn activate(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // clicking the split pane swaps the two
+        if self.split == Some(i) {
+            self.split = Some(self.active);
+        }
+        self.active = i;
+        window.focus(&self.focus[i]);
+        cx.notify();
+    }
+
+    fn close(&mut self, tab: gpui::EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(i) = self.tabs.iter().position(|t| t.entity_id() == tab) else {
+            return;
+        };
+        if self.tabs.len() == 1 {
+            return;
+        }
+        self.tabs.remove(i);
+        self.focus.remove(i);
+        self.split = self.split.and_then(|s| match s {
+            s if s == i => None,
+            s if s > i => Some(s - 1),
+            s => Some(s),
+        });
+        let next = if self.active >= i {
+            self.active.saturating_sub(1)
+        } else {
+            self.active
+        };
+        self.active = next.min(self.tabs.len() - 1);
+        if self.split == Some(self.active) {
+            self.split = None;
+        }
+        self.activate(self.active, window, cx);
+    }
+
+    fn toggle_split(&mut self, template: App, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split.take().is_some() {
+            return cx.notify();
+        }
+        let active = self.active;
+        if self.tabs.len() == 1 {
+            let tab = cx.new(|cx| Db9s::new(template, self.rt.handle().clone(), state::load(), cx));
+            self.add(tab, window, cx);
+        }
+        // the new or next tab goes right, focus stays left
+        self.split = Some(if self.active != active {
+            self.active
+        } else {
+            (active + 1) % self.tabs.len()
+        });
+        self.activate(active, window, cx);
+    }
+
+    /// A click inside a tab's pane makes it the active one.
+    fn focus_tab(&mut self, tab: gpui::EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = self.tabs.iter().position(|t| t.entity_id() == tab) {
+            if i != self.active {
+                self.activate(i, window, cx);
+            }
+        }
+    }
+}
+
+impl Render for Workspace {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette();
+        let tabs = self.tabs.iter().enumerate().map(|(i, t)| {
+            let label = format!("{}  {}", i + 1, t.read(cx).title());
+            let tab = div()
+                .id(i)
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .debug_selector(|| format!("tab-{i}"))
+                .on_click(cx.listener(move |ws, _, window, cx| ws.activate(i, window, cx)))
+                .child(label);
+            if i == self.active {
+                tab.bg(p.selected_bg).text_color(p.selected_fg)
+            } else if Some(i) == self.split {
+                tab.text_color(p.border_focus)
+            } else {
+                tab.text_color(p.muted)
+            }
+        });
+        let bar = div()
+            .flex()
+            .flex_row()
+            .bg(rgb(BG))
+            .text_color(rgb(FG))
+            .font_family("Menlo")
+            .text_sm()
+            .border_b_1()
+            .border_color(p.border_blur)
+            .children(tabs);
+        let panes = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.tabs[self.active].clone()),
+            )
+            .children(self.split.map(|i| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .border_l_1()
+                    .border_color(p.border_blur)
+                    .child(self.tabs[i].clone())
+            }));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .children((self.tabs.len() > 1).then_some(bar))
+            .child(panes)
+    }
+}
+
 impl Render for Db9s {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let size = window.bounds().size;
@@ -521,6 +772,15 @@ impl Render for Db9s {
         let mut root = div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    let me = cx.entity_id();
+                    if let Some(ws) = this.workspace.as_ref().and_then(|w| w.upgrade()) {
+                        ws.update(cx, |ws, cx| ws.focus_tab(me, window, cx));
+                    }
+                }),
+            )
             .on_mouse_move(cx.listener(Self::on_resize_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -1554,7 +1814,8 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"name": "Mouse", "tags": ["a", "b"]}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         cx.run_until_parked();
         let bounds = cx.debug_bounds("tree-tags").expect("tags line is rendered");
         cx.simulate_click(bounds.center(), Default::default());
@@ -1575,7 +1836,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut app = rt.block_on(App::new(Default::default(), false));
         app.mode = Mode::Normal; // no connections opens the add-connection form
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         let typing = |text: &str| {
             let keys: Vec<KeyEvent> = text
                 .chars()
@@ -1620,7 +1882,8 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"id": 1, "name": "Mouse"}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         view.update(cx, |v, cx| {
             for k in [
                 KeyCode::Char('e'),
@@ -1659,7 +1922,8 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         cx.run_until_parked();
         let head = cx.debug_bounds("head-id").expect("header is rendered");
         cx.simulate_click(head.center(), Default::default());
@@ -1684,7 +1948,8 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"id": 1, "name": "a,b"}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, Default::default(), cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         cx.update(|window, cx| window.focus(&view.read(cx).focus));
         cx.run_until_parked();
         cx.simulate_keystrokes("cmd-c");
@@ -1706,6 +1971,47 @@ mod tests {
             );
             assert!(v.editing.is_none());
         });
+    }
+
+    /// Cmd-T opens a tab on the same connections, Cmd-1 switches, Cmd-\\ splits,
+    /// Cmd-W closes.
+    #[gpui::test]
+    fn tabs_open_switch_split_and_close(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.mode = Mode::Normal;
+        let (ws, cx) = cx.add_window_view(|window, cx| {
+            let first = cx.new(|cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
+            let weak = cx.weak_entity();
+            let focus = first.update(cx, |t, _| {
+                t.workspace = Some(weak);
+                t.focus.clone()
+            });
+            window.focus(&focus);
+            Workspace {
+                rt,
+                tabs: vec![first],
+                focus: vec![focus],
+                active: 0,
+                split: None,
+            }
+        });
+        let state = |cx: &mut gpui::VisualTestContext| {
+            ws.read_with(cx, |w, _| (w.tabs.len(), w.active, w.split))
+        };
+        cx.simulate_keystrokes("cmd-t");
+        assert_eq!(state(cx), (2, 1, None));
+        cx.simulate_keystrokes("cmd-1");
+        assert_eq!(state(cx), (2, 0, None));
+        cx.simulate_keystrokes("cmd-\\");
+        assert_eq!(state(cx), (2, 0, Some(1)));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tab-1").is_some(),
+            "tab bar shows with 2 tabs"
+        );
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(state(cx), (1, 0, None));
     }
 
     #[test]
