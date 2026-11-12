@@ -1,23 +1,34 @@
 //! Desktop frontend: the same `App`, screens and keys as the TUI, drawn with GPUI.
+mod state;
+
 use db9s_core::app::{AddField, App, BrowseFocus, FieldEdit, Mode, Screen};
+use db9s_core::config::Kind;
+use db9s_core::datasource::Sort;
 use db9s_core::input::Input;
 use db9s_core::key::{KeyCode, KeyEvent};
 use db9s_core::theme::{self, BorderType, Color};
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, Application, Bounds, Context, CursorStyle, Div,
-    FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions,
+    div, point, prelude::*, px, rgb, size, uniform_list, Application, Bounds, ClipboardItem,
+    Context, CursorStyle, Div, Entity, FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ScrollHandle, ScrollStrategy, SharedString, Task,
+    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const BG: u32 = 0x1a1b1e;
 const FG: u32 = 0xd4d4d4;
+/// At zoom 1 (14px text); everything sized in px scales with the zoom.
 const LINE_HEIGHT: f32 = 20.;
 /// Menlo advance at text_sm (14px), to size columns from their content.
 const CHAR_WIDTH: f32 = 8.5;
+const ZOOMS: (f32, f32) = (0.6, 2.5);
+/// Terminal editors: they need a terminal, which a window doesn't have.
+const TERMINAL_EDITORS: [&str; 9] = [
+    "vi", "vim", "nvim", "nano", "micro", "hx", "helix", "kak", "joe",
+];
 const MIN_COL_WIDTH: f32 = 40.;
 
 fn main() {
@@ -26,18 +37,34 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let cfg = db9s_core::config::load().unwrap_or_default();
     let app = rt.block_on(App::new(cfg, read_only));
+    let saved = state::load();
 
     Application::new().run(move |cx: &mut gpui::App| {
-        let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+        let (w, h) = saved.window.unwrap_or((1200., 780.));
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| Db9s::new(app, rt, cx));
-                window.focus(&view.read(cx).focus);
-                view
+                let handle = rt.handle().clone();
+                let first = cx.new(|cx| Db9s::new(app, handle, saved, cx));
+                let ws = cx.new(|_| Workspace {
+                    rt,
+                    tabs: vec![],
+                    focus: vec![],
+                    active: 0,
+                    split: None,
+                });
+                ws.update(cx, |ws, cx| ws.add(first, window, cx));
+                let weak = ws.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    weak.update(cx, |ws, cx| ws.tabs[ws.active].read(cx).save_state())
+                        .ok();
+                    true
+                });
+                ws
             },
         )
         .unwrap();
@@ -47,7 +74,9 @@ fn main() {
 
 struct Db9s {
     app: App,
-    rt: tokio::runtime::Runtime,
+    rt: tokio::runtime::Handle,
+    /// The tab bar this view lives in; None alone (tests).
+    workspace: Option<WeakEntity<Workspace>>,
     focus: FocusHandle,
     conn_scroll: UniformListScrollHandle,
     db_scroll: UniformListScrollHandle,
@@ -61,19 +90,40 @@ struct Db9s {
     /// Kept across rows, so the same field stays open while moving through a table.
     unfolded: HashSet<String>,
     tree_scroll: UniformListScrollHandle,
+    /// Horizontal scroll of the grid, moved to keep the edited cell in view.
+    grid_scroll: ScrollHandle,
+    font: SharedString,
+    zoom: f32,
+    /// Last rendered window size, saved on quit.
+    window_size: (f32, f32),
+    /// `E`: the GUI editor running on a row's temp file.
+    editing: Option<(
+        tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+        db9s_core::app::EditorRequest,
+    )>,
     _poll: Task<()>,
 }
 
 impl Db9s {
-    fn new(app: App, rt: tokio::runtime::Runtime, cx: &mut Context<Self>) -> Self {
-        // same 100ms tick as the TUI loop, for background connection attempts
+    fn new(
+        app: App,
+        rt: tokio::runtime::Handle,
+        saved: state::GuiState,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // same 100ms tick as the TUI loop, for background database calls and `E`
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(100))
                 .await;
             let alive = this.update(cx, |this, cx| {
-                if this.app.is_busy() {
+                // browsing: keep polling so live metrics get sampled
+                if this.app.is_busy() || this.app.screen == Screen::Browse {
                     this.rt.block_on(this.app.poll());
+                    cx.notify();
+                }
+                if this.editing.as_ref().is_some_and(|(h, _)| h.is_finished()) {
+                    this.finish_editing();
                     cx.notify();
                 }
             });
@@ -81,6 +131,19 @@ impl Db9s {
                 break;
             }
         });
+        // Ctrl-C in the terminal that started it: quit like Cmd-Q, state saved
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        rt.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            if rx.await.is_ok() {
+                let _ = this.update(cx, |this, cx| this.quit(cx));
+            }
+        })
+        .detach();
         Self {
             app,
             rt,
@@ -89,32 +152,257 @@ impl Db9s {
             db_scroll: Default::default(),
             container_scroll: Default::default(),
             row_scroll: Default::default(),
-            col_widths: HashMap::new(),
+            workspace: None,
+            col_widths: saved.col_widths,
             resizing: None,
             unfolded: HashSet::new(),
             tree_scroll: Default::default(),
+            grid_scroll: ScrollHandle::new(),
+            font: saved.font.unwrap_or_else(|| "Menlo".into()).into(),
+            zoom: saved.zoom.unwrap_or(1.).clamp(ZOOMS.0, ZOOMS.1),
+            window_size: saved.window.unwrap_or((1200., 780.)),
+            editing: None,
             _poll: poll,
         }
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if ev.keystroke.modifiers.platform && ev.keystroke.key == "q" {
-            cx.quit();
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let k = &ev.keystroke;
+        if k.modifiers.platform {
+            match k.key.as_str() {
+                "t" | "w" | "\\" | "[" | "]" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8"
+                | "9" => {
+                    let key = k.key.clone();
+                    self.tab_key(&key, window, cx);
+                }
+                "q" => self.quit(cx),
+                "c" => self.copy(k.modifiers.shift, cx),
+                "=" | "+" => self.zoom = (self.zoom + 0.1).min(ZOOMS.1),
+                "-" => self.zoom = (self.zoom - 0.1).max(ZOOMS.0),
+                "0" => self.zoom = 1.,
+                _ => return,
+            }
+            cx.notify();
             return;
         }
-        let Some(key) = to_core_key(&ev.keystroke) else {
+        if matches!(self.app.mode, Mode::Query) {
+            match k.key.as_str() {
+                "enter" if k.modifiers.shift => {
+                    self.app.query_input.insert_str("\n");
+                    return cx.notify();
+                }
+                "tab" if !k.modifiers.shift => {
+                    self.complete_query();
+                    return cx.notify();
+                }
+                _ => {}
+            }
+        }
+        let Some(key) = to_core_key(k) else {
             return;
         };
         // returns at once: database calls run in the background, applied by the poll tick
         self.rt.block_on(self.app.handle_key(key));
         if let Some(req) = self.app.editor_request.take() {
-            let _ = std::fs::remove_file(&req.tmp_path);
-            self.app.status = "error: E ($EDITOR) is TUI-only for now, use e".into();
+            self.open_editor(req);
         }
         if self.app.should_quit {
-            cx.quit();
+            // q in one of several tabs closes that tab, in the last one quits
+            let tabs = self
+                .workspace
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|w| w.read(cx).tabs.len());
+            if tabs.unwrap_or(1) > 1 {
+                self.app.should_quit = false;
+                self.tab_key("w", window, cx);
+            } else {
+                self.quit(cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Cmd-T new tab, Cmd-W close it, Cmd-1..9 / Cmd-[ ] switch, Cmd-\ split.
+    fn tab_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.workspace.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let me = cx.entity_id();
+        let template = (key == "t" || key == "\\").then(|| self.new_tab_app());
+        ws.update(cx, |ws, cx| match key {
+            "t" => {
+                let tab = cx.new(|cx| {
+                    Db9s::new(template.unwrap(), ws.rt.handle().clone(), state::load(), cx)
+                });
+                ws.add(tab, window, cx);
+            }
+            "\\" => ws.toggle_split(template.unwrap(), window, cx),
+            "w" => ws.close(me, window, cx),
+            "[" => ws.activate((ws.active + ws.tabs.len() - 1) % ws.tabs.len(), window, cx),
+            "]" => ws.activate((ws.active + 1) % ws.tabs.len(), window, cx),
+            n => {
+                let i = n.parse::<usize>().unwrap_or(1) - 1;
+                if i < ws.tabs.len() {
+                    ws.activate(i, window, cx);
+                }
+            }
+        });
+    }
+
+    /// A fresh `App` for a new tab, on the connections this one already has open.
+    fn new_tab_app(&self) -> App {
+        let mut cfg = db9s_core::config::load().unwrap_or_default();
+        cfg.connections.clear();
+        let mut app = self.rt.block_on(App::new(cfg, self.app.force_read_only));
+        app.conns = self
+            .app
+            .conns
+            .iter()
+            .map(|c| db9s_core::app::ConnEntry {
+                name: c.name.clone(),
+                kind: c.kind,
+                url: c.url.clone(),
+                read_only: c.read_only,
+                source: c
+                    .source
+                    .as_ref()
+                    .map(Arc::clone)
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+            })
+            .collect();
+        app.mode = if app.conns.is_empty() {
+            Mode::AddConnection
+        } else {
+            Mode::Normal
+        };
+        app
+    }
+
+    /// The tab label: connection, then database and container once open.
+    fn title(&self) -> String {
+        let a = &self.app;
+        let conn = a.conns.get(a.conn_idx).map_or("db9s", |c| c.name.as_str());
+        match a.screen {
+            Screen::Connections => "connections".into(),
+            Screen::Databases => conn.into(),
+            Screen::Browse => format!(
+                "{conn} › {}",
+                a.containers
+                    .get(a.container_idx)
+                    .cloned()
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Tab in the query editor: completes the word before the cursor from the tables
+    /// and columns on screen, and SQL keywords.
+    fn complete_query(&mut self) {
+        let (before, _, _) = self.app.query_input.split_at_cursor();
+        let mut word: Vec<char> = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        word.reverse();
+        let word: String = word.into_iter().collect();
+        let mut names: Vec<String> = self.app.containers.clone();
+        if let Some(res) = &self.app.result {
+            names.extend(res.columns.iter().cloned());
+        }
+        names.extend(SQL_KEYWORDS.iter().map(|k| k.to_string()));
+        let Some(best) = db9s_core::app::complete(&names, &word).into_iter().next() else {
+            return;
+        };
+        let rest: String = best.chars().skip(word.chars().count()).collect();
+        // keywords follow the case being typed: `sel` -> `select`
+        let lower = SQL_KEYWORDS.contains(&best.as_str()) && !word.chars().any(char::is_uppercase);
+        self.app
+            .query_input
+            .insert_str(&if lower { rest.to_lowercase() } else { rest });
+    }
+
+    fn save_state(&self) {
+        let state = state::GuiState {
+            col_widths: self.col_widths.clone(),
+            window: Some(self.window_size),
+            font: Some(self.font.to_string()),
+            zoom: Some(self.zoom),
+        };
+        // shortcut: a failed save only loses layout, not data; surface it if users ask
+        let _ = state::save(&state);
+    }
+
+    fn quit(&self, cx: &mut Context<Self>) {
+        self.save_state();
+        cx.quit();
+    }
+
+    /// Cmd-C: the selected row as JSON; Cmd-Shift-C: the whole page as CSV.
+    fn copy(&mut self, page: bool, cx: &mut Context<Self>) {
+        let Some(res) = &self.app.result else {
+            return;
+        };
+        let (text, what) = if page {
+            (
+                db9s_core::export::to_csv(res),
+                format!("{} rows as CSV", res.rows.len()),
+            )
+        } else {
+            let Some(row) = res.rows.get(self.app.row_idx) else {
+                return;
+            };
+            (
+                serde_json::to_string_pretty(row).unwrap_or_default(),
+                "row as JSON".to_string(),
+            )
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.app.status = format!("copied {what}");
+    }
+
+    /// `E` in a window: the configured editor must be a GUI one that waits, like
+    /// `code --wait` or `zed --wait`; the result comes back through the poll tick.
+    fn open_editor(&mut self, req: db9s_core::app::EditorRequest) {
+        let mut words = self.app.editor_cmd.split_whitespace().map(String::from);
+        let program = words.next().unwrap_or_default();
+        let name = std::path::Path::new(&program)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if TERMINAL_EDITORS.contains(&name.as_str()) {
+            let _ = std::fs::remove_file(&req.tmp_path);
+            self.app.status = format!(
+                "error: {name} needs a terminal; set a GUI editor in settings (s), e.g. \"code --wait\""
+            );
+            return;
+        }
+        let args: Vec<String> = words.collect();
+        let path = req.tmp_path.clone();
+        let handle = self.rt.spawn_blocking(move || {
+            std::process::Command::new(&program)
+                .args(&args)
+                .arg(&path)
+                .status()
+        });
+        self.app.status = format!("editing in {name}… (close the file to come back)");
+        self.editing = Some((handle, req));
+    }
+
+    fn finish_editing(&mut self) {
+        let Some((handle, req)) = self.editing.take() else {
+            return;
+        };
+        let status = self.rt.block_on(handle);
+        let content = std::fs::read_to_string(&req.tmp_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&req.tmp_path);
+        match status {
+            Ok(Ok(s)) if s.success() => self.app.finish_external_edit(&content, req.original),
+            Ok(Ok(_)) => self.app.status = "editor exited with an error, edit discarded".into(),
+            Ok(Err(e)) => self.app.status = format!("error: failed to launch editor: {e}"),
+            Err(e) => self.app.status = format!("error: editor task failed: {e}"),
+        }
     }
 }
 
@@ -366,13 +654,175 @@ fn compact(v: &serde_json::Value) -> String {
     }
 }
 
-impl Render for Db9s {
+/// The window: a tab bar over one tab, or two side by side (Cmd-\\).
+struct Workspace {
+    /// Owned here so it lives as long as the window; tabs get a handle.
+    rt: tokio::runtime::Runtime,
+    tabs: Vec<Entity<Db9s>>,
+    /// Each tab's focus, kept here: a tab asking to switch is mid-update, so the
+    /// workspace can't read it then.
+    focus: Vec<FocusHandle>,
+    active: usize,
+    /// The tab shown right of the active one.
+    split: Option<usize>,
+}
+
+impl Workspace {
+    fn add(&mut self, tab: Entity<Db9s>, window: &mut Window, cx: &mut Context<Self>) {
+        let me = cx.entity().downgrade();
+        let focus = tab.update(cx, |t, _| {
+            t.workspace = Some(me);
+            t.focus.clone()
+        });
+        self.tabs.push(tab);
+        self.focus.push(focus);
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn activate(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // clicking the split pane swaps the two
+        if self.split == Some(i) {
+            self.split = Some(self.active);
+        }
+        self.active = i;
+        window.focus(&self.focus[i]);
+        cx.notify();
+    }
+
+    fn close(&mut self, tab: gpui::EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(i) = self.tabs.iter().position(|t| t.entity_id() == tab) else {
+            return;
+        };
+        if self.tabs.len() == 1 {
+            return;
+        }
+        self.tabs.remove(i);
+        self.focus.remove(i);
+        self.split = self.split.and_then(|s| match s {
+            s if s == i => None,
+            s if s > i => Some(s - 1),
+            s => Some(s),
+        });
+        let next = if self.active >= i {
+            self.active.saturating_sub(1)
+        } else {
+            self.active
+        };
+        self.active = next.min(self.tabs.len() - 1);
+        if self.split == Some(self.active) {
+            self.split = None;
+        }
+        self.activate(self.active, window, cx);
+    }
+
+    fn toggle_split(&mut self, template: App, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split.take().is_some() {
+            return cx.notify();
+        }
+        let active = self.active;
+        if self.tabs.len() == 1 {
+            let tab = cx.new(|cx| Db9s::new(template, self.rt.handle().clone(), state::load(), cx));
+            self.add(tab, window, cx);
+        }
+        // the new or next tab goes right, focus stays left
+        self.split = Some(if self.active != active {
+            self.active
+        } else {
+            (active + 1) % self.tabs.len()
+        });
+        self.activate(active, window, cx);
+    }
+
+    /// A click inside a tab's pane makes it the active one.
+    fn focus_tab(&mut self, tab: gpui::EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = self.tabs.iter().position(|t| t.entity_id() == tab) {
+            if i != self.active {
+                self.activate(i, window, cx);
+            }
+        }
+    }
+}
+
+impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette();
+        let tabs = self.tabs.iter().enumerate().map(|(i, t)| {
+            let label = format!("{}  {}", i + 1, t.read(cx).title());
+            let tab = div()
+                .id(i)
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .debug_selector(|| format!("tab-{i}"))
+                .on_click(cx.listener(move |ws, _, window, cx| ws.activate(i, window, cx)))
+                .child(label);
+            if i == self.active {
+                tab.bg(p.selected_bg).text_color(p.selected_fg)
+            } else if Some(i) == self.split {
+                tab.text_color(p.border_focus)
+            } else {
+                tab.text_color(p.muted)
+            }
+        });
+        let bar = div()
+            .flex()
+            .flex_row()
+            .bg(rgb(BG))
+            .text_color(rgb(FG))
+            .font_family("Menlo")
+            .text_sm()
+            .border_b_1()
+            .border_color(p.border_blur)
+            .children(tabs);
+        let panes = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.tabs[self.active].clone()),
+            )
+            .children(self.split.map(|i| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .border_l_1()
+                    .border_color(p.border_blur)
+                    .child(self.tabs[i].clone())
+            }));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .children((self.tabs.len() > 1).then_some(bar))
+            .child(panes)
+    }
+}
+
+impl Render for Db9s {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = window.bounds().size;
+        self.window_size = (f32::from(size.width), f32::from(size.height));
+        // rem-based sizes (text, spacing) follow the zoom; px ones are scaled by hand
+        window.set_rem_size(px(16. * self.zoom));
         let p = palette();
         let app = &self.app;
         let mut root = div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    let me = cx.entity_id();
+                    if let Some(ws) = this.workspace.as_ref().and_then(|w| w.upgrade()) {
+                        ws.update(cx, |ws, cx| ws.focus_tab(me, window, cx));
+                    }
+                }),
+            )
             .on_mouse_move(cx.listener(Self::on_resize_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -386,9 +836,9 @@ impl Render for Db9s {
             .p_2()
             .bg(rgb(BG))
             .text_color(rgb(FG))
-            .font_family("Menlo")
+            .font_family(self.font.clone())
             .text_sm()
-            .line_height(px(LINE_HEIGHT))
+            .line_height(px(LINE_HEIGHT * self.zoom))
             .child(header(app, &p));
         if matches!(app.mode, Mode::Command) {
             root = root.child(command_prompt(app, &p));
@@ -410,7 +860,11 @@ impl Render for Db9s {
                 .into_any_element(),
             Screen::Browse => self.browse(&p, cx).into_any_element(),
         };
-        root = root.child(body).child(footer(app, &p));
+        root = root.child(body);
+        if matches!(app.mode, Mode::Query) {
+            root = root.child(query_editor(app, &p));
+        }
+        root = root.child(footer(app, &p));
         if let Some(modal) = modal(app, &p) {
             root = root.child(
                 div()
@@ -453,17 +907,14 @@ impl Db9s {
             Some(fe) => field_editor(fe, p),
             None => self.inspector(p, cx),
         };
-        let right = if containers_focused {
-            self.grid(false, p, cx)
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .min_h_0()
-                .child(self.grid(true, p, cx).flex_1().min_h_0())
-                .child(below.h_2_5())
-        };
+        let right = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_h_0()
+            .child(self.grid(!containers_focused, p, cx).flex_1().min_h_0())
+            .children((!containers_focused).then(|| below.h_2_5()))
+            .children(live_charts(app, p));
         div()
             .flex()
             .flex_row()
@@ -479,13 +930,13 @@ impl Db9s {
         self.col_widths
             .get(col)
             .copied()
-            .unwrap_or_else(|| auto_width(col, rows))
+            .unwrap_or_else(|| auto_width(col, rows, CHAR_WIDTH * self.zoom))
     }
 }
 
 /// A column sized to its name and the first rows' values, capped so one long JSON
 /// blob doesn't take the whole screen.
-fn auto_width(col: &str, rows: &[db9s_core::value::Row]) -> f32 {
+fn auto_width(col: &str, rows: &[db9s_core::value::Row], char_width: f32) -> f32 {
     let longest = rows
         .iter()
         .take(50)
@@ -494,7 +945,7 @@ fn auto_width(col: &str, rows: &[db9s_core::value::Row]) -> f32 {
         .chain([col.chars().count()])
         .max()
         .unwrap_or(0);
-    (longest.clamp(4, 40) as f32 * CHAR_WIDTH + 16.).max(MIN_COL_WIDTH)
+    (longest.clamp(4, 40) as f32 * char_width + 16.).max(MIN_COL_WIDTH)
 }
 
 impl Db9s {
@@ -527,6 +978,7 @@ impl Db9s {
             .map(|c| self.col_width(c, &res.rows))
             .collect();
         let total: f32 = widths.iter().sum();
+        self.scroll_to_edited_cell(&res.columns, &widths);
         let header = div()
             .flex()
             .flex_row()
@@ -535,7 +987,18 @@ impl Db9s {
             .border_color(p.border_blur)
             .children(res.columns.iter().zip(&widths).map(|(col, w)| {
                 let (col_name, w) = (col.clone(), *w);
+                let arrow = match &app.sort {
+                    Some(s) if &s.column == col => {
+                        if s.desc {
+                            " ↓"
+                        } else {
+                            " ↑"
+                        }
+                    }
+                    _ => "",
+                };
                 div()
+                    .id(SharedString::from(format!("head-{col}")))
                     .relative()
                     .flex_shrink_0()
                     .w(px(w))
@@ -543,7 +1006,28 @@ impl Db9s {
                     .truncate()
                     .text_color(p.field_name)
                     .font_weight(gpui::FontWeight::BOLD)
-                    .child(col.clone())
+                    .cursor_pointer()
+                    .debug_selector(|| format!("head-{col}"))
+                    // click: ascending, again: descending, again: natural order
+                    .on_click(cx.listener({
+                        let col = col.clone();
+                        move |this, _, _, cx| {
+                            let next = match &this.app.sort {
+                                Some(s) if s.column == col && s.desc => None,
+                                Some(s) if s.column == col => Some(Sort {
+                                    column: col.clone(),
+                                    desc: true,
+                                }),
+                                _ => Some(Sort {
+                                    column: col.clone(),
+                                    desc: false,
+                                }),
+                            };
+                            this.app.set_sort(next);
+                            cx.notify();
+                        }
+                    }))
+                    .child(format!("{col}{arrow}"))
                     .child(
                         // drag handle on the right edge
                         div()
@@ -581,7 +1065,11 @@ impl Db9s {
                     .filter_map(|i| Some((i, res.rows.get(i)?)))
                     .map(|(i, row)| {
                         // the selected row, while field-edited, shows its pending values
-                        let fe = app.field_edit.as_ref().filter(|_| selected == Some(i));
+                        // (a new row isn't in the page: it only shows in the panel below)
+                        let fe = app
+                            .field_edit
+                            .as_ref()
+                            .filter(|fe| selected == Some(i) && !fe.insert);
                         let row = fe.map_or(row, |fe| &fe.edited);
                         let current = fe.and_then(|fe| fe.edited.keys().nth(fe.idx));
                         let cells = res.columns.iter().zip(widths.iter()).map(|(col, w)| {
@@ -644,6 +1132,7 @@ impl Db9s {
                 .flex_1()
                 .min_h_0()
                 .overflow_x_scroll()
+                .track_scroll(&self.grid_scroll)
                 .child(
                     div()
                         .flex()
@@ -762,6 +1251,33 @@ impl Db9s {
         )
     }
 
+    /// While a row is field-edited, scrolls the grid sideways just enough to show the
+    /// current field's column.
+    fn scroll_to_edited_cell(&self, columns: &[String], widths: &[f32]) {
+        let Some(fe) = self.app.field_edit.as_ref().filter(|fe| !fe.insert) else {
+            return;
+        };
+        let Some(field) = fe.edited.keys().nth(fe.idx) else {
+            return;
+        };
+        let Some(i) = columns.iter().position(|c| c == field) else {
+            return;
+        };
+        let start: f32 = widths[..i].iter().sum();
+        let end = start + widths[i];
+        let offset = self.grid_scroll.offset();
+        let view = f32::from(self.grid_scroll.bounds().size.width);
+        let shown = -f32::from(offset.x);
+        let target = if start < shown {
+            start
+        } else if view > 0. && end > shown + view {
+            end - view
+        } else {
+            return;
+        };
+        self.grid_scroll.set_offset(point(px(-target), offset.y));
+    }
+
     fn on_resize_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some((col, x0, w0)) = &self.resizing else {
             return;
@@ -774,6 +1290,233 @@ impl Db9s {
         let w = (w0 + f32::from(ev.position.x) - x0).max(MIN_COL_WIDTH);
         self.col_widths.insert(col.clone(), w);
         cx.notify();
+    }
+}
+
+const SQL_KEYWORDS: [&str; 52] = [
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "NULL",
+    "IS",
+    "IN",
+    "LIKE",
+    "ILIKE",
+    "ORDER",
+    "BY",
+    "GROUP",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "FULL",
+    "ON",
+    "AS",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "DISTINCT",
+    "COUNT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "ASC",
+    "DESC",
+    "WITH",
+    "UNION",
+    "ALL",
+    "EXISTS",
+    "BETWEEN",
+    "CREATE",
+    "TABLE",
+    "DROP",
+    "ALTER",
+    "RETURNING",
+    "EXPLAIN",
+    "SHOW",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tok {
+    Plain,
+    Keyword,
+    Str,
+    Num,
+    /// true / false / null
+    Lit,
+}
+
+/// Splits a query into colored runs: strings, numbers, true/false/null, and (for SQL)
+/// keywords. Good enough to read a query at a glance, not a parser.
+fn tokenize(text: &str, sql: bool) -> Vec<(String, Tok)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(String, Tok)> = vec![];
+    let mut push = |s: String, t: Tok| match out.last_mut() {
+        Some((last, Tok::Plain)) if t == Tok::Plain => last.push_str(&s),
+        _ => out.push((s, t)),
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let start = i;
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                i += 1;
+            }
+            i = (i + 1).min(chars.len());
+            push(chars[start..i].iter().collect(), Tok::Str);
+        } else if c.is_ascii_digit() {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+                i += 1;
+            }
+            push(chars[start..i].iter().collect(), Tok::Num);
+        } else if c.is_alphabetic() || c == '_' {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let upper = word.to_uppercase();
+            let tok = if ["TRUE", "FALSE", "NULL"].contains(&upper.as_str()) {
+                Tok::Lit
+            } else if sql && SQL_KEYWORDS.contains(&upper.as_str()) {
+                Tok::Keyword
+            } else {
+                Tok::Plain
+            };
+            push(word, tok);
+        } else {
+            i += 1;
+            push(c.to_string(), Tok::Plain);
+        }
+    }
+    out
+}
+
+fn highlight(text: &str, sql: bool, p: &Palette) -> Vec<Span> {
+    tokenize(text, sql)
+        .into_iter()
+        .map(|(t, tok)| match tok {
+            Tok::Plain => raw(t),
+            Tok::Keyword => styled(t, p.border_focus).bold(),
+            Tok::Str => styled(t, p.success),
+            Tok::Num => styled(t, p.key_hint),
+            Tok::Lit => styled(t, p.muted),
+        })
+        .collect()
+}
+
+/// The `/` prompt as a multi-line, highlighted editor with the cursor drawn in.
+fn query_editor(app: &App, p: &Palette) -> Div {
+    let sql = !matches!(
+        app.conns.get(app.conn_idx).map(|c| c.kind),
+        Some(Kind::Mongo | Kind::Redis | Kind::RabbitMq)
+    );
+    let (before, at, after) = app.query_input.split_at_cursor();
+    let (cur_line, col) = match before.rsplit_once('\n') {
+        Some((head, tail)) => (head.matches('\n').count() + 1, tail),
+        None => (0, before),
+    };
+    let text = format!(
+        "{before}{}{after}",
+        at.map(String::from).unwrap_or_default()
+    );
+    let cursor = Span {
+        fg: Some(rgb(BG).into()),
+        bg: Some(rgb(FG).into()),
+        // at a line end the char under the cursor is the newline itself
+        ..raw(at
+            .filter(|c| *c != '\n')
+            .map_or(" ".to_string(), String::from))
+    };
+    let lines = text.split('\n').enumerate().map(|(i, l)| {
+        if i != cur_line {
+            return line(highlight(l, sql, p));
+        }
+        let col_chars = col.chars().count();
+        let head: String = l.chars().take(col_chars).collect();
+        let skip = col_chars + usize::from(at.is_some_and(|c| c != '\n'));
+        let tail: String = l.chars().skip(skip).collect();
+        let mut spans = highlight(&head, sql, p);
+        spans.push(cursor.clone());
+        spans.extend(highlight(&tail, sql, p));
+        line(spans)
+    });
+    let title = if app.is_queue() { "publish" } else { "query" };
+    pane(
+        format!(
+            "{title}  (shift+enter new line, tab complete, ↑/↓ history, enter run, esc cancel)"
+        ),
+        p.border_focus,
+        p,
+    )
+    .children(lines)
+}
+
+/// Sparklines of the open container's metrics (queue depth, Redis memory...), newest
+/// on the right; nothing for backends without metrics.
+fn live_charts(app: &App, p: &Palette) -> Option<Div> {
+    if app.metrics.is_empty() {
+        return None;
+    }
+    const HEIGHT: f32 = 36.;
+    let charts = app.metrics.iter().map(|(name, series)| {
+        let max = series.iter().cloned().fold(0., f64::max);
+        let last = series.back().copied().unwrap_or(0.);
+        let bars = series.iter().map(|v| {
+            let h = if max > 0. {
+                (v / max) as f32 * HEIGHT
+            } else {
+                0.
+            };
+            div().w(px(3.)).h(px(h.max(1.))).bg(p.border_focus)
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(line(vec![
+                styled(format!("{name} "), p.muted),
+                styled(format_metric(last), p.key_hint).bold(),
+            ]))
+            .child(
+                div()
+                    .h(px(HEIGHT))
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(1.))
+                    .children(bars),
+            )
+    });
+    Some(
+        pane(
+            format!("live  (every {}s)", db9s_core::app::METRICS_EVERY.as_secs()),
+            p.border_blur,
+            p,
+        )
+        .child(div().flex().flex_row().gap_6().children(charts)),
+    )
+}
+
+/// 3, 2.5, 1234 — no trailing zeros for counts, two decimals for rates and sizes.
+fn format_metric(v: f64) -> String {
+    if v.fract() == 0. {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.2}")
     }
 }
 
@@ -967,19 +1710,24 @@ fn field_editor(fe: &FieldEdit, p: &Palette) -> Div {
             l
         }
     });
-    pane("edit row", p.border_focus, p).children(lines)
+    pane(
+        if fe.insert {
+            "new row  (null = database default)"
+        } else {
+            "edit row"
+        },
+        p.border_focus,
+        p,
+    )
+    .children(lines)
 }
 
 fn footer(app: &App, p: &Palette) -> Div {
     if matches!(app.mode, Mode::Query) {
-        let prompt = if app.is_queue() {
-            "publish> "
-        } else {
-            "query> "
-        };
-        let mut spans = vec![raw(prompt)];
-        spans.extend(input_spans(&app.query_input, true));
-        return line(spans).text_color(p.selected_fg);
+        return line(help_spans(
+            "enter run  shift+enter new_line  tab complete  ↑/↓ history  esc cancel",
+            p,
+        ));
     }
     if matches!(
         app.mode,
@@ -1035,6 +1783,12 @@ fn modal_box(title: impl Into<SharedString>, p: &Palette) -> Div {
         .child(div().text_color(p.modal_border).child(title.into()))
 }
 
+/// The statement the open confirm would run, wrapped, once the backend says.
+fn preview(app: &App, p: &Palette) -> Option<Div> {
+    let sql = app.confirm_preview.clone()?;
+    Some(div().text_color(p.muted).child(sql))
+}
+
 /// A labelled form field, highlighted when it has focus.
 fn field(label: &str, value: Vec<Span>, focused: bool, p: &Palette) -> Div {
     let d = div()
@@ -1055,15 +1809,17 @@ fn field(label: &str, value: Vec<Span>, focused: bool, p: &Palette) -> Div {
 
 fn modal(app: &App, p: &Palette) -> Option<Div> {
     Some(match app.mode {
-        Mode::ConfirmDelete => modal_box("confirm", p).child(line(vec![styled(
-            if app.is_queue() {
-                "purge every message in this queue?"
-            } else {
-                "delete this row/document?"
-            },
-            p.success,
-        )
-        .bold()])),
+        Mode::ConfirmDelete => modal_box("confirm", p)
+            .child(line(vec![styled(
+                if app.is_queue() {
+                    "purge every message in this queue?"
+                } else {
+                    "delete this row/document?"
+                },
+                p.success,
+            )
+            .bold()]))
+            .children(preview(app, p)),
         Mode::ConfirmDeleteConn => {
             let name = app.conns.get(app.conn_idx).map_or("", |c| c.name.as_str());
             modal_box("confirm", p).child(line(vec![styled(
@@ -1093,6 +1849,7 @@ fn modal(app: &App, p: &Palette) -> Option<Div> {
                     styled("save these changes? y/n", p.success).bold()
                 ]))
                 .children(diffs)
+                .children(preview(app, p))
         }
         Mode::Settings => modal_box("settings (tab field, ←/→ theme, enter save, esc cancel)", p)
             .child(field(
@@ -1183,6 +1940,37 @@ fn modal(app: &App, p: &Palette) -> Option<Div> {
             )
             .child(line(vec![msg]))
         }
+        Mode::Schema => {
+            let schema = app.schema.as_ref()?;
+            let container = app
+                .containers
+                .get(app.container_idx)
+                .cloned()
+                .unwrap_or_default();
+            let row = |cells: Vec<Span>| {
+                div().flex().flex_row().children(cells.into_iter().map(|c| {
+                    div()
+                        .w(px(150.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .child(line(vec![c]))
+                }))
+            };
+            modal_box(format!("schema: {container}  (esc close)"), p)
+                .w(px(820.))
+                .child(row(schema
+                    .columns
+                    .iter()
+                    .map(|c| styled(c.clone(), p.field_name).bold())
+                    .collect()))
+                .children(schema.rows.iter().map(|r| {
+                    row(schema
+                        .columns
+                        .iter()
+                        .map(|c| raw(r.get(c).map(compact).unwrap_or_default()))
+                        .collect())
+                }))
+        }
         Mode::Normal | Mode::Query | Mode::FieldEdit | Mode::Command => return None,
     })
 }
@@ -1239,10 +2027,10 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"id": 22, "bio": "{}"}}"#, "y".repeat(500)))
                 .unwrap(),
         ];
-        assert_eq!(auto_width("id", &rows), 4. * CHAR_WIDTH + 16.);
-        assert_eq!(auto_width("bio", &rows), 40. * CHAR_WIDTH + 16.);
+        assert_eq!(auto_width("id", &rows, CHAR_WIDTH), 4. * CHAR_WIDTH + 16.);
+        assert_eq!(auto_width("bio", &rows, CHAR_WIDTH), 40. * CHAR_WIDTH + 16.);
         assert_eq!(
-            auto_width("a_long_column_name", &[]),
+            auto_width("a_long_column_name", &[], CHAR_WIDTH),
             18. * CHAR_WIDTH + 16.
         );
     }
@@ -1292,7 +2080,8 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"name": "Mouse", "tags": ["a", "b"]}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         cx.run_until_parked();
         let bounds = cx.debug_bounds("tree-tags").expect("tags line is rendered");
         cx.simulate_click(bounds.center(), Default::default());
@@ -1313,7 +2102,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut app = rt.block_on(App::new(Default::default(), false));
         app.mode = Mode::Normal; // no connections opens the add-connection form
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         let typing = |text: &str| {
             let keys: Vec<KeyEvent> = text
                 .chars()
@@ -1358,7 +2148,8 @@ mod tests {
             rows: vec![serde_json::from_str(r#"{"id": 1, "name": "Mouse"}"#).unwrap()],
             affected: None,
         });
-        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
         view.update(cx, |v, cx| {
             for k in [
                 KeyCode::Char('e'),
@@ -1381,6 +2172,180 @@ mod tests {
             let fe = v.app.field_edit.as_ref().unwrap();
             assert_eq!(fe.edited["name"], "MouseX");
         });
+    }
+
+    /// Clicking a grid header asks the core to sort by that column (the sorting itself
+    /// is tested in the core; here, no connection: the core refuses, proving the click).
+    #[gpui::test]
+    fn clicking_a_header_sorts(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["id".into()],
+            rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
+        cx.run_until_parked();
+        let head = cx.debug_bounds("head-id").expect("header is rendered");
+        cx.simulate_click(head.center(), Default::default());
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.app.status, "error: this backend can't sort")
+        });
+    }
+
+    /// Cmd-C copies the selected row, Cmd-Shift-C the page; Cmd +/-/0 zoom; `E` with
+    /// a terminal editor is refused instead of hanging on a terminal that isn't there.
+    #[gpui::test]
+    fn cmd_keys_copy_and_zoom(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.editor_cmd = "nvim".into();
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![serde_json::from_str(r#"{"id": 1, "name": "a,b"}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
+        cx.update(|window, cx| window.focus(&view.read(cx).focus));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert!(copied.contains("\"name\": \"a,b\""), "{copied}");
+        cx.simulate_keystrokes("cmd-shift-c");
+        let csv = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert_eq!(csv, "id,name\r\n1,\"a,b\"\r\n");
+        cx.simulate_keystrokes("cmd-= cmd-=");
+        view.read_with(cx, |v, _| assert!((v.zoom - 1.2).abs() < 1e-4));
+        cx.simulate_keystrokes("cmd-0");
+        view.read_with(cx, |v, _| assert_eq!(v.zoom, 1.));
+        cx.simulate_keystrokes("shift-e");
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.app.status.contains("nvim needs a terminal"),
+                "{}",
+                v.app.status
+            );
+            assert!(v.editing.is_none());
+        });
+    }
+
+    /// Cmd-T opens a tab on the same connections, Cmd-1 switches, Cmd-\\ splits,
+    /// Cmd-W closes.
+    #[gpui::test]
+    fn tabs_open_switch_split_and_close(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.mode = Mode::Normal;
+        let (ws, cx) = cx.add_window_view(|window, cx| {
+            let first = cx.new(|cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
+            let weak = cx.weak_entity();
+            let focus = first.update(cx, |t, _| {
+                t.workspace = Some(weak);
+                t.focus.clone()
+            });
+            window.focus(&focus);
+            Workspace {
+                rt,
+                tabs: vec![first],
+                focus: vec![focus],
+                active: 0,
+                split: None,
+            }
+        });
+        let state = |cx: &mut gpui::VisualTestContext| {
+            ws.read_with(cx, |w, _| (w.tabs.len(), w.active, w.split))
+        };
+        cx.simulate_keystrokes("cmd-t");
+        assert_eq!(state(cx), (2, 1, None));
+        cx.simulate_keystrokes("cmd-1");
+        assert_eq!(state(cx), (2, 0, None));
+        cx.simulate_keystrokes("cmd-\\");
+        assert_eq!(state(cx), (2, 0, Some(1)));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tab-1").is_some(),
+            "tab bar shows with 2 tabs"
+        );
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(state(cx), (1, 0, None));
+    }
+
+    #[test]
+    fn tokenizes_queries() {
+        let marked: Vec<(String, Tok)> = tokenize(
+            "select * from t where n = 'it''s' and x > 4.5 or y is null",
+            true,
+        )
+        .into_iter()
+        .filter(|(_, t)| *t != Tok::Plain)
+        .collect();
+        let expect: Vec<(String, Tok)> = [
+            ("select", Tok::Keyword),
+            ("from", Tok::Keyword),
+            ("where", Tok::Keyword),
+            ("'it'", Tok::Str),
+            ("'s'", Tok::Str),
+            ("and", Tok::Keyword),
+            ("4.5", Tok::Num),
+            ("or", Tok::Keyword),
+            ("is", Tok::Keyword),
+            ("null", Tok::Lit),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.to_string(), t))
+        .collect();
+        assert_eq!(marked, expect);
+        // mongo: no keywords, JSON strings and literals still
+        let mongo = tokenize(r#"{"name": "select", "n": 1, "ok": true}"#, false);
+        assert!(mongo.iter().all(|(_, t)| *t != Tok::Keyword));
+        assert!(mongo.contains(&("true".into(), Tok::Lit)));
+        // plain runs merge: one span per gap, not per char
+        assert_eq!(tokenize("a  +  b", true).len(), 1);
+    }
+
+    /// Shift+enter adds a line, tab completes a table, a column and keywords.
+    #[gpui::test]
+    fn query_editor_multiline_and_completion(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Query;
+        app.containers = vec!["products".into()];
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["price".into()],
+            rows: vec![],
+            affected: None,
+        });
+        let (view, cx) =
+            cx.add_window_view(|_, cx| Db9s::new(app, rt.handle().clone(), Default::default(), cx));
+        cx.update(|window, cx| window.focus(&view.read(cx).focus));
+        cx.simulate_keystrokes("s e l tab space * space f r o m space p r o tab");
+        cx.simulate_keystrokes("shift-enter w h e r tab space p r i tab");
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.app.query_input.value(),
+                "select * from products\nwhere price"
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn formats_metrics() {
+        assert_eq!(format_metric(3.), "3");
+        assert_eq!(format_metric(2.5), "2.50");
+        assert_eq!(format_metric(0.), "0");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! One generic engine for every SQL database (Postgres, MySQL, ...): listing, paging,
 //! raw queries, and edit/delete by the table's real primary key. A new SQL backend only
 //! implements `SqlDialect`: identifier quoting, placeholders, catalog queries, row decoding.
-use super::{DataSource, QueryResult};
+use super::{DataSource, QueryResult, Sort};
 use crate::value::Row;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -13,6 +13,20 @@ use std::sync::Mutex;
 
 pub type ConnOptions<DB> = <<DB as Database>::Connection as Connection>::Options;
 
+/// Writes the n-th (1-based) value's spot in a statement: a bind placeholder, or a literal.
+type Mark<'a> = &'a (dyn Fn(usize, &Value) -> String + Sync);
+
+/// A value as an SQL literal, to show a statement (never to run one: those bind values).
+fn literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => b.to_string().to_uppercase(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
 pub trait SqlDialect: Send + Sync + 'static {
     type DB: Database;
     /// Lists browsable schemas/databases, one text column.
@@ -23,6 +37,9 @@ pub trait SqlDialect: Send + Sync + 'static {
     const PRIMARY_KEY: &'static str;
     /// Makes the session reject writes, run on each connection of a read-only source.
     const READ_ONLY_SESSION: &'static str;
+    /// Columns of (schema, table) bound as parameters, in order, as text columns
+    /// `column`, `type`, `nullable`, `default`.
+    const DESCRIBE: &'static str;
 
     fn quote(ident: &str) -> String;
     /// Bind marker for the n-th parameter (1-based), e.g. `$1` or `?`.
@@ -52,6 +69,7 @@ where
     for<'q> bool: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'q> Option<String>: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'r> String: sqlx::Decode<'r, D::DB>,
+    for<'r> i64: sqlx::Decode<'r, D::DB>,
     usize: sqlx::ColumnIndex<<D::DB as Database>::Row>,
 {
     pub async fn connect(url: &str, read_only: bool) -> Result<Self> {
@@ -121,13 +139,15 @@ where
         Ok(pool)
     }
 
-    /// `WHERE pk1 = ? AND pk2 = ?` for `row`, numbering placeholders from `first`.
+    /// `WHERE pk1 = ? AND pk2 = ?` for `row`, numbering placeholders from `first`;
+    /// `mark` writes each value's spot: a placeholder to run, a literal to show.
     async fn where_pk(
         &self,
         database: &str,
         table: &str,
         row: &Row,
         first: usize,
+        mark: Mark<'_>,
     ) -> Result<(String, Vec<Value>)> {
         let pk = self.names(D::PRIMARY_KEY, &[database, table]).await?;
         if pk.is_empty() {
@@ -143,9 +163,82 @@ where
                     .cloned()
                     .ok_or_else(|| anyhow!("row is missing primary key column {col}"))?,
             );
-            clauses.push(format!("{} = {}", D::quote(col), D::placeholder(first + i)));
+            clauses.push(format!(
+                "{} = {}",
+                D::quote(col),
+                mark(first + i, &row[col])
+            ));
         }
         Ok((clauses.join(" AND "), values))
+    }
+
+    async fn page(
+        &self,
+        database: &str,
+        table: &str,
+        limit: i64,
+        offset: i64,
+        sort: Option<&Sort>,
+    ) -> Result<QueryResult> {
+        let order = sort.map_or(String::new(), |s| {
+            let dir = if s.desc { "DESC" } else { "ASC" };
+            format!(" ORDER BY {} {dir}", D::quote(&s.column))
+        });
+        let sql = format!(
+            "SELECT * FROM {}{order} LIMIT {limit} OFFSET {offset}",
+            Self::table(database, table)
+        );
+        let rows = sqlx::query::<D::DB>(&sql).fetch_all(&self.pool).await?;
+        Ok(Self::to_result(&rows))
+    }
+
+    async fn delete_sql(
+        &self,
+        database: &str,
+        table: &str,
+        row: &Row,
+        mark: Mark<'_>,
+    ) -> Result<(String, Vec<Value>)> {
+        let (clause, values) = self.where_pk(database, table, row, 1, mark).await?;
+        let sql = format!(
+            "DELETE FROM {} WHERE {clause}",
+            Self::table(database, table)
+        );
+        Ok((sql, values))
+    }
+
+    /// The UPDATE for the fields that changed, or None if nothing did.
+    async fn update_sql(
+        &self,
+        database: &str,
+        table: &str,
+        original: &Row,
+        edited: &Row,
+        mark: Mark<'_>,
+    ) -> Result<Option<(String, Vec<Value>)>> {
+        let changed: Vec<(&String, &Value)> = edited
+            .iter()
+            .filter(|(k, v)| original.get(*k) != Some(*v))
+            .collect();
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let set = changed
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| format!("{} = {}", D::quote(k), mark(i + 1, v)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (clause, key_values) = self
+            .where_pk(database, table, original, changed.len() + 1, mark)
+            .await?;
+        let sql = format!(
+            "UPDATE {} SET {set} WHERE {clause}",
+            Self::table(database, table)
+        );
+        let mut values: Vec<Value> = changed.into_iter().map(|(_, v)| v.clone()).collect();
+        values.extend(key_values);
+        Ok(Some((sql, values)))
     }
 
     async fn execute(&self, sql: &str, values: &[Value]) -> Result<()> {
@@ -196,6 +289,7 @@ where
     for<'q> bool: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'q> Option<String>: sqlx::Encode<'q, D::DB> + sqlx::Type<D::DB>,
     for<'r> String: sqlx::Decode<'r, D::DB>,
+    for<'r> i64: sqlx::Decode<'r, D::DB>,
     usize: sqlx::ColumnIndex<<D::DB as Database>::Row>,
 {
     fn is_read_query(&self, raw: &str) -> bool {
@@ -217,12 +311,28 @@ where
         limit: i64,
         offset: i64,
     ) -> Result<QueryResult> {
-        let sql = format!(
-            "SELECT * FROM {} LIMIT {limit} OFFSET {offset}",
-            Self::table(database, table)
-        );
-        let rows = sqlx::query::<D::DB>(&sql).fetch_all(&self.pool).await?;
-        Ok(Self::to_result(&rows))
+        self.page(database, table, limit, offset, None).await
+    }
+
+    fn can_sort(&self) -> bool {
+        true
+    }
+
+    async fn fetch_sorted(
+        &self,
+        database: &str,
+        table: &str,
+        limit: i64,
+        offset: i64,
+        sort: &Sort,
+    ) -> Result<QueryResult> {
+        self.page(database, table, limit, offset, Some(sort)).await
+    }
+
+    async fn count_rows(&self, database: &str, table: &str) -> Result<Option<u64>> {
+        let sql = format!("SELECT COUNT(*) FROM {}", Self::table(database, table));
+        let row = sqlx::query::<D::DB>(&sql).fetch_one(&self.pool).await?;
+        Ok(Some(row.try_get::<i64, _>(0usize)? as u64))
     }
 
     async fn run_query(&self, database: &str, _table: &str, raw: &str) -> Result<QueryResult> {
@@ -241,12 +351,75 @@ where
     }
 
     async fn delete_row(&self, database: &str, table: &str, row: &Row) -> Result<()> {
-        let (clause, values) = self.where_pk(database, table, row, 1).await?;
+        let (sql, values) = self
+            .delete_sql(database, table, row, &|n, _| D::placeholder(n))
+            .await?;
+        self.execute(&sql, &values).await
+    }
+
+    async fn preview_delete(
+        &self,
+        database: &str,
+        table: &str,
+        row: &Row,
+    ) -> Result<Option<String>> {
+        let (sql, _) = self
+            .delete_sql(database, table, row, &|_, v| literal(v))
+            .await?;
+        Ok(Some(sql))
+    }
+
+    async fn preview_update(
+        &self,
+        database: &str,
+        table: &str,
+        original: &Row,
+        edited: &Row,
+    ) -> Result<Option<String>> {
+        let sql = self
+            .update_sql(database, table, original, edited, &|_, v| literal(v))
+            .await?;
+        Ok(sql.map(|(sql, _)| sql))
+    }
+
+    async fn insert_row(&self, database: &str, table: &str, row: &Row) -> Result<()> {
+        if row.is_empty() {
+            return Err(anyhow!("set at least one field to insert a row"));
+        }
+        let cols = row
+            .keys()
+            .map(|k| D::quote(k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = (1..=row.len())
+            .map(D::placeholder)
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
-            "DELETE FROM {} WHERE {clause}",
+            "INSERT INTO {} ({cols}) VALUES ({marks})",
             Self::table(database, table)
         );
+        let values: Vec<Value> = row.values().cloned().collect();
         self.execute(&sql, &values).await
+    }
+
+    async fn describe(&self, database: &str, table: &str) -> Result<QueryResult> {
+        let mut q = sqlx::query::<D::DB>(D::DESCRIBE);
+        q = q.bind(database.to_string()).bind(table.to_string());
+        let mut res = Self::to_result(&q.fetch_all(&self.pool).await?);
+        let pk = self.names(D::PRIMARY_KEY, &[database, table]).await?;
+        for row in &mut res.rows {
+            let is_pk = row
+                .get("column")
+                .and_then(Value::as_str)
+                .is_some_and(|c| pk.iter().any(|k| k == c));
+            row.insert(
+                "key".into(),
+                Value::String(if is_pk { "PK" } else { "" }.into()),
+            );
+        }
+        res.columns.push("key".into());
+        Ok(res)
     }
 
     async fn update_row(
@@ -256,35 +429,29 @@ where
         original: &Row,
         edited: &Row,
     ) -> Result<()> {
-        let changed: Vec<(&String, &Value)> = edited
-            .iter()
-            .filter(|(k, v)| original.get(*k) != Some(*v))
-            .collect();
-        if changed.is_empty() {
-            return Ok(());
+        match self
+            .update_sql(database, table, original, edited, &|n, _| D::placeholder(n))
+            .await?
+        {
+            Some((sql, values)) => self.execute(&sql, &values).await,
+            None => Ok(()),
         }
-        let set = changed
-            .iter()
-            .enumerate()
-            .map(|(i, (k, _))| format!("{} = {}", D::quote(k), D::placeholder(i + 1)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (clause, key_values) = self
-            .where_pk(database, table, original, changed.len() + 1)
-            .await?;
-        let sql = format!(
-            "UPDATE {} SET {set} WHERE {clause}",
-            Self::table(database, table)
-        );
-        let mut values: Vec<Value> = changed.into_iter().map(|(_, v)| v.clone()).collect();
-        values.extend(key_values);
-        self.execute(&sql, &values).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_read_sql, returns_rows};
+    use super::{is_read_sql, literal, returns_rows};
+    use serde_json::json;
+
+    #[test]
+    fn literals_for_shown_statements() {
+        assert_eq!(literal(&json!("O'Brien")), "'O''Brien'");
+        assert_eq!(literal(&json!(null)), "NULL");
+        assert_eq!(literal(&json!(4.5)), "4.5");
+        assert_eq!(literal(&json!(true)), "TRUE");
+        assert_eq!(literal(&json!({"a": "b'c"})), "'{\"a\":\"b''c\"}'");
+    }
 
     #[test]
     fn detects_queries_that_return_rows() {

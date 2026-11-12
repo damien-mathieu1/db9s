@@ -13,12 +13,15 @@ pub enum Kind {
     RabbitMq,
     Redis,
     MySql,
+    /// `sqlite://path/to/file.db`.
+    Sqlite,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Postgres,
         Kind::MySql,
+        Kind::Sqlite,
         Kind::Mongo,
         Kind::RabbitMq,
         Kind::Redis,
@@ -31,6 +34,7 @@ impl Kind {
             Kind::RabbitMq => "rabbitmq",
             Kind::Redis => "redis",
             Kind::MySql => "mysql",
+            Kind::Sqlite => "sqlite",
         }
     }
 

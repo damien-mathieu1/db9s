@@ -1,17 +1,24 @@
 use crate::config::{Config, Kind};
-use crate::datasource::{DataSource, QueryResult, ReadOnly};
+use crate::datasource::{DataSource, QueryResult, ReadOnly, Sort};
 use crate::input::Input;
 use crate::key::{KeyCode, KeyEvent};
 use crate::value::Row;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 pub const PAGE_SIZE: i64 = 200;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+/// How often the open container's metrics are sampled, and how many samples are kept.
+pub const METRICS_EVERY: Duration = Duration::from_secs(2);
+pub const METRICS_KEPT: usize = 60;
+
+/// One sample: (series name, value) per metric.
+type Metrics = Vec<(String, f64)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -38,6 +45,8 @@ pub enum Mode {
     Settings,
     /// k9s-style `:` prompt to jump to a connection, database or container by name.
     Command,
+    /// The current container's columns (`i`), in `App::schema`.
+    Schema,
 }
 
 /// Inline, field-by-field edit of one row/document, saved in one update.
@@ -47,6 +56,8 @@ pub struct FieldEdit {
     pub idx: usize,
     /// `Some` while the selected field's value is being typed.
     pub input: Option<Input>,
+    /// A new row (`a`): saved with an insert, fields left null get the database default.
+    pub insert: bool,
 }
 
 /// A row/document sent out to the user's $EDITOR; picked up by the main loop
@@ -126,6 +137,23 @@ pub struct App {
     pub containers: Vec<String>,
     pub result: Option<QueryResult>,
     pub offset: i64,
+    /// Server-side order of the rows pane, set with `:sort <column> [desc]`.
+    pub sort: Option<Sort>,
+    /// Rows in the current container, when the backend counts them.
+    pub total: Option<u64>,
+    /// What `i` shows: one row per column of the current container.
+    pub schema: Option<QueryResult>,
+    /// Live series for the open container (`DataSource::metrics`), oldest sample first.
+    pub metrics: Vec<(String, VecDeque<f64>)>,
+    /// Which (database, container) `metrics` belongs to.
+    metrics_for: Option<(String, String)>,
+    sampler: Option<JoinHandle<Result<Metrics>>>,
+    last_sample: Option<Instant>,
+    /// The statement the open delete/save confirm would run, once the backend says.
+    pub confirm_preview: Option<String>,
+    history: crate::history::History,
+    /// Which history entry ↑/↓ shows in the query prompt; None = what's being typed.
+    history_idx: Option<usize>,
 
     pub query_input: Input,
     pub status: String,
@@ -167,7 +195,7 @@ async fn connect(kind: Kind, url: &str, read_only: bool) -> Result<Box<dyn DataS
     let url = &crate::secrets::resolve(url).await?;
     use crate::datasource::{
         amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
-        rabbitmq::RabbitMqSource, redis::RedisSource,
+        rabbitmq::RabbitMqSource, redis::RedisSource, sqlite::SqliteSource,
     };
     let fut = async {
         Ok(match kind {
@@ -179,6 +207,7 @@ async fn connect(kind: Kind, url: &str, read_only: bool) -> Result<Box<dyn DataS
             Kind::RabbitMq => Box::new(RabbitMqSource::connect(url).await?),
             Kind::Redis => Box::new(RedisSource::connect(url).await?),
             Kind::MySql => Box::new(MySqlSource::connect(url, read_only).await?),
+            Kind::Sqlite => Box::new(SqliteSource::connect(url, read_only).await?),
         })
     };
     let source = tokio::time::timeout(CONNECT_TIMEOUT, fut)
@@ -220,10 +249,15 @@ enum Done {
     Databases(Vec<String>),
     Containers(Vec<String>),
     /// Rows of the current container; `true` focuses the rows pane once they're in.
-    Rows(QueryResult, bool),
+    /// ...and the container's total row count, when known.
+    Rows(QueryResult, bool, Option<u64>),
     Query(QueryResult),
     Saved,
     Deleted,
+    Inserted,
+    Schema(QueryResult),
+    /// The statement a pending confirm would run.
+    Preview(Option<String>),
 }
 
 struct Pending {
@@ -283,6 +317,16 @@ impl App {
             containers: vec![],
             result: None,
             offset: 0,
+            sort: None,
+            total: None,
+            schema: None,
+            confirm_preview: None,
+            metrics: vec![],
+            metrics_for: None,
+            sampler: None,
+            last_sample: None,
+            history: crate::history::load(),
+            history_idx: None,
             query_input: Input::default(),
             status: theme_error.unwrap_or_default(),
             should_quit: false,
@@ -315,6 +359,7 @@ impl App {
     /// call); called once per event-loop tick so the UI never waits on the network.
     pub async fn poll(&mut self) {
         self.poll_connecting().await;
+        self.sample_metrics().await;
         if !self
             .pending
             .as_ref()
@@ -329,6 +374,60 @@ impl App {
             Err(e) if e.is_cancelled() => {}
             Err(e) => self.status = format!("error: database task panicked: {e}"),
         }
+    }
+
+    /// Keeps `metrics` sampling the open container every `METRICS_EVERY`, starting
+    /// over when another one opens. Runs beside `pending`, so it never cancels a read.
+    async fn sample_metrics(&mut self) {
+        if self.sampler.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Ok(Ok(values)) = self.sampler.take().unwrap().await {
+                for (name, v) in values {
+                    let series = match self.metrics.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, s)) => s,
+                        None => {
+                            self.metrics.push((name, VecDeque::new()));
+                            &mut self.metrics.last_mut().unwrap().1
+                        }
+                    };
+                    series.push_back(v);
+                    if series.len() > METRICS_KEPT {
+                        series.pop_front();
+                    }
+                }
+            }
+        }
+        let open = match (self.screen, self.current_db(), self.current_container()) {
+            (Screen::Browse, Some(db), Some(c)) => Some((db.to_string(), c.to_string())),
+            _ => None,
+        };
+        if open != self.metrics_for {
+            if let Some(h) = self.sampler.take() {
+                h.abort();
+            }
+            self.metrics.clear();
+            self.last_sample = None;
+            self.metrics_for = open.clone();
+        }
+        let Some((db, container)) = open else {
+            return;
+        };
+        let due = self
+            .last_sample
+            .is_none_or(|t| t.elapsed() >= METRICS_EVERY);
+        if self.sampler.is_some() || !due {
+            return;
+        }
+        let Some(source) = self
+            .conns
+            .get(self.conn_idx)
+            .and_then(|c| c.source.as_ref().ok().cloned())
+        else {
+            return;
+        };
+        self.last_sample = Some(Instant::now());
+        self.sampler = Some(tokio::spawn(async move {
+            source.metrics(&db, &container).await
+        }));
     }
 
     /// Whether something is still running in the background (to keep polling).
@@ -348,14 +447,16 @@ impl App {
                 self.containers = c;
                 self.container_idx = 0;
                 self.result = None;
+                self.sort = None;
                 self.screen = Screen::Browse;
                 self.browse_focus = BrowseFocus::Containers;
                 self.status = String::new();
                 self.load_rows();
             }
-            Done::Rows(res, focus_rows) => {
+            Done::Rows(res, focus_rows, total) => {
                 self.row_idx = 0;
-                self.status = format!("{} rows (offset {})", res.rows.len(), self.offset);
+                self.total = total;
+                self.status = self.rows_status(res.rows.len());
                 self.result = Some(res);
                 if focus_rows {
                     self.browse_focus = BrowseFocus::Rows;
@@ -377,6 +478,23 @@ impl App {
             Done::Deleted => {
                 self.status = "deleted".into();
                 self.load_rows();
+            }
+            Done::Inserted => {
+                self.status = "inserted".into();
+                self.load_rows();
+            }
+            Done::Preview(sql) => {
+                if matches!(self.mode, Mode::ConfirmDelete | Mode::ConfirmEditSave) {
+                    self.confirm_preview = sql;
+                }
+            }
+            Done::Schema(res) => {
+                self.status = String::new();
+                // only if nothing else took the screen while it loaded
+                if matches!(self.mode, Mode::Normal) {
+                    self.schema = Some(res);
+                    self.mode = Mode::Schema;
+                }
             }
         }
     }
@@ -524,6 +642,15 @@ impl App {
             Mode::ConfirmDeleteConn => self.handle_confirm_delete_conn_key(key).await,
             Mode::Settings => self.handle_settings_key(key),
             Mode::Command => self.handle_command_key(key).await,
+            Mode::Schema => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'i')
+                ) {
+                    self.schema = None;
+                    self.mode = Mode::Normal;
+                }
+            }
         }
     }
 
@@ -567,9 +694,17 @@ impl App {
             KeyCode::Char('/') if self.rows_focused() => {
                 self.mode = Mode::Query;
                 self.query_input = Input::default();
+                self.history_idx = None;
             }
-            KeyCode::Char('e' | 'E' | 'd') if self.rows_focused() && self.is_read_only() => {
-                self.status = "read-only connection: edit and delete are off".into();
+            KeyCode::Char('e' | 'E' | 'd' | 'a') if self.rows_focused() && self.is_read_only() => {
+                self.status = "read-only connection: insert, edit and delete are off".into();
+            }
+            KeyCode::Char('a') if self.rows_focused() && self.is_queue() => {
+                self.status = "use / to publish a message".into();
+            }
+            KeyCode::Char('a') if self.rows_focused() => self.start_insert(),
+            KeyCode::Char('i') if self.screen == Screen::Browse && !self.is_queue() => {
+                self.load_schema()
             }
             KeyCode::Char('e') | KeyCode::Char('E') if self.rows_focused() && self.is_queue() => {
                 self.status = "rabbitmq messages are read-only".into();
@@ -578,6 +713,8 @@ impl App {
             KeyCode::Char('E') if self.rows_focused() => self.start_edit(),
             KeyCode::Char('d') if self.rows_focused() && self.selected_row().is_some() => {
                 self.mode = Mode::ConfirmDelete;
+                let row = self.selected_row().unwrap().clone();
+                self.preview(move |s, db, c| async move { s.preview_delete(&db, &c, &row).await });
             }
             KeyCode::Char(':') => {
                 self.command_input = Input::default();
@@ -599,6 +736,9 @@ impl App {
         if matches!(self.mode, Mode::Command) {
             return "enter run  tab/→ complete  ↑/↓ suggestions  esc cancel";
         }
+        if matches!(self.mode, Mode::Schema) {
+            return "esc/i close";
+        }
         if matches!(self.mode, Mode::Settings) {
             return "tab switch_field  ←/→ preview_theme  enter save  esc cancel";
         }
@@ -613,18 +753,23 @@ impl App {
             Screen::Connections => "j/k move  enter open  a add  e edit  d delete  s settings  : command  q quit",
             Screen::Databases => "j/k move  enter open  : command  esc back",
             Screen::Browse => match self.browse_focus {
-                BrowseFocus::Containers => "j/k move+preview  enter/tab rows  : command  esc back",
+                BrowseFocus::Containers if self.is_queue() => {
+                    "j/k move+preview  enter/tab rows  : command  esc back"
+                }
+                BrowseFocus::Containers => {
+                    "j/k move+preview  enter/tab rows  i schema  : command  esc back"
+                }
                 BrowseFocus::Rows if self.is_read_only() && self.is_queue() => {
                     "j/k move  n/p page  r refresh  tab queues  esc back"
                 }
                 BrowseFocus::Rows if self.is_read_only() => {
-                    "j/k move  / query  n/p page  r refresh  tab containers  esc back"
+                    "j/k move  / query  i schema  n/p page  r refresh  tab containers  esc back"
                 }
                 BrowseFocus::Rows if self.is_queue() => {
                     "j/k move  / publish  d purge queue  n/p page  r refresh  tab queues  esc back"
                 }
                 BrowseFocus::Rows => {
-                    "j/k move  e edit  E $EDITOR  d delete  / query  n/p page  r refresh  tab containers  esc back"
+                    "j/k move  e edit  E $EDITOR  a insert  d delete  / query  i schema  n/p page  r refresh  tab containers  esc back"
                 }
             },
         }
@@ -640,6 +785,14 @@ impl App {
         }
         if self.screen == Screen::Browse {
             out.extend(self.containers.iter().cloned());
+            if let Some(res) = &self.result {
+                out.extend(["export csv".into(), "export json".into()]);
+                out.push("sort".into());
+                for c in &res.columns {
+                    out.push(format!("sort {c}"));
+                    out.push(format!("sort {c} desc"));
+                }
+            }
         }
         out.extend(
             crate::theme::names()
@@ -711,6 +864,20 @@ impl App {
     }
 
     async fn run_command(&mut self, cmd: &str) {
+        if let Some(format) = cmd.strip_prefix("export ") {
+            self.status = match (&self.result, self.current_container()) {
+                (Some(res), Some(name)) => match crate::export::write(res, format.trim(), name) {
+                    Ok(path) => format!("exported {} rows to {}", res.rows.len(), path.display()),
+                    Err(e) => format!("error: {e:#}"),
+                },
+                _ => "error: open a table first".into(),
+            };
+            return;
+        }
+        if cmd == "sort" || cmd.starts_with("sort ") {
+            self.sort_command(&cmd[4..]);
+            return;
+        }
         if cmd == "theme" {
             self.status = format!(
                 "theme: {} (available: {})",
@@ -742,6 +909,7 @@ impl App {
                     self.container_idx = i;
                     self.browse_focus = BrowseFocus::Containers;
                     self.offset = 0;
+                    self.sort = None;
                     self.fetch_rows(true);
                 } else if let Some(i) = (self.screen != Screen::Connections)
                     .then(|| find(&self.databases))
@@ -768,7 +936,9 @@ impl App {
     // shortcut: one fetch per keypress, no debounce; add one if holding j/k on many tables gets slow
     fn preview_container(&mut self) {
         if self.screen == Screen::Browse && self.browse_focus == BrowseFocus::Containers {
+            // another container, other columns: its own natural order
             self.offset = 0;
+            self.sort = None;
             self.load_rows();
         }
     }
@@ -833,6 +1003,8 @@ impl App {
                     self.container_idx = 0;
                     self.result = None;
                     self.offset = 0;
+                    self.sort = None;
+                    self.total = None;
                     self.row_idx = 0;
                     self.screen = Screen::Databases;
                 }
@@ -887,12 +1059,81 @@ impl App {
             Some(c) => c.to_string(),
             None => return,
         };
-        let offset = self.offset;
+        let (offset, sort) = (self.offset, self.sort.clone());
         self.start("loading rows...", false, move |s| async move {
-            s.fetch_rows(&db, &container, PAGE_SIZE, offset)
-                .await
-                .map(|r| Done::Rows(r, focus_rows))
+            let res = match &sort {
+                Some(o) => {
+                    s.fetch_sorted(&db, &container, PAGE_SIZE, offset, o)
+                        .await?
+                }
+                None => s.fetch_rows(&db, &container, PAGE_SIZE, offset).await?,
+            };
+            // a failed count only hides paging, it doesn't fail the page
+            let total = s.count_rows(&db, &container).await.ok().flatten();
+            Ok(Done::Rows(res, focus_rows, total))
         });
+    }
+
+    /// `200 rows (offset 0)`, plus `of 1234, page 1/7` and the sort when known.
+    fn rows_status(&self, shown: usize) -> String {
+        let mut s = format!("{shown} rows (offset {})", self.offset);
+        if let Some(total) = self.total {
+            let pages = total.div_ceil(PAGE_SIZE as u64).max(1);
+            let page = self.offset as u64 / PAGE_SIZE as u64 + 1;
+            s += &format!(" of {total}, page {page}/{pages}");
+        }
+        if let Some(o) = &self.sort {
+            s += &format!(
+                ", sorted by {} {}",
+                o.column,
+                if o.desc { "↓" } else { "↑" }
+            );
+        }
+        s
+    }
+
+    /// Reorders the rows pane server-side and reloads it from the first page; None
+    /// back to the natural order. Used by `:sort` and the GUI's header clicks.
+    pub fn set_sort(&mut self, sort: Option<Sort>) {
+        if self.screen != Screen::Browse || self.result.is_none() {
+            self.status = "error: open a table first".into();
+            return;
+        }
+        if sort.is_some() && !self.current_source().is_some_and(|s| s.can_sort()) {
+            self.status = "error: this backend can't sort".into();
+            return;
+        }
+        self.sort = sort;
+        self.offset = 0;
+        self.load_rows();
+    }
+
+    /// `:sort`, `:sort <column>`, `:sort <column> desc`.
+    fn sort_command(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        let Some(column) = words.next() else {
+            return self.set_sort(None);
+        };
+        let desc = match words.next() {
+            None | Some("asc") => false,
+            Some("desc") => true,
+            Some(other) => {
+                self.status = format!("error: sort direction '{other}' is not asc or desc");
+                return;
+            }
+        };
+        let known = self
+            .result
+            .as_ref()
+            .is_some_and(|r| r.columns.iter().any(|c| c == column));
+        if !known {
+            self.status = format!("error: no column '{column}' here");
+            return;
+        }
+        self.set_sort(Some(Sort {
+            column: column.to_string(),
+            desc,
+        }));
     }
 
     async fn handle_query_key(&mut self, key: KeyEvent) {
@@ -900,11 +1141,18 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
             }
+            KeyCode::Up | KeyCode::Down => self.recall(key.code == KeyCode::Up),
             KeyCode::Enter => {
                 let db = self.current_db().unwrap_or_default().to_string();
                 let container = self.current_container().unwrap_or_default().to_string();
                 let raw = self.query_input.value().to_string();
                 self.mode = Mode::Normal;
+                if let Some(conn) = self.conns.get(self.conn_idx) {
+                    let queries = self.history.entry(conn.name.clone()).or_default();
+                    crate::history::push(queries, &raw);
+                    // losing history isn't worth interrupting the query for
+                    let _ = crate::history::save(&self.history);
+                }
                 // a raw query may write, so it's never aborted
                 self.start("running query...", true, move |s| async move {
                     s.run_query(&db, &container, &raw).await.map(Done::Query)
@@ -914,6 +1162,26 @@ impl App {
                 self.query_input.handle(key);
             }
         }
+    }
+
+    /// ↑ older / ↓ newer query of this connection into the prompt; past the newest,
+    /// back to an empty prompt.
+    fn recall(&mut self, older: bool) {
+        let Some(queries) = self
+            .conns
+            .get(self.conn_idx)
+            .and_then(|c| self.history.get(&c.name))
+            .filter(|q| !q.is_empty())
+        else {
+            return;
+        };
+        self.history_idx = match (self.history_idx, older) {
+            (None, true) => Some(queries.len() - 1),
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) if i + 1 < queries.len() => Some(i + 1),
+            (_, false) => None,
+        };
+        self.query_input = Input::new(self.history_idx.map_or("", |i| &queries[i]));
     }
 
     fn save_row(&mut self, original: &Row, edited: &Row) {
@@ -936,8 +1204,72 @@ impl App {
             edited: row,
             idx: 0,
             input: None,
+            insert: false,
         });
         self.mode = Mode::FieldEdit;
+    }
+
+    /// A blank row with the page's columns, edited like any row and inserted on save.
+    fn start_insert(&mut self) {
+        let Some(res) = &self.result else {
+            return;
+        };
+        let blank: Row = res
+            .columns
+            .iter()
+            .map(|c| (c.clone(), serde_json::Value::Null))
+            .collect();
+        if blank.is_empty() {
+            self.status = "error: no columns to fill in (empty table?), use / to insert".into();
+            return;
+        }
+        self.field_edit = Some(FieldEdit {
+            original: blank.clone(),
+            edited: blank,
+            idx: 0,
+            input: None,
+            insert: true,
+        });
+        self.mode = Mode::FieldEdit;
+    }
+
+    fn insert_row(&mut self, row: Row) {
+        let db = self.current_db().unwrap_or_default().to_string();
+        let container = self.current_container().unwrap_or_default().to_string();
+        // null = not set: let the database fill ids and defaults
+        let row: Row = row.into_iter().filter(|(_, v)| !v.is_null()).collect();
+        self.start("inserting...", true, move |s| async move {
+            s.insert_row(&db, &container, &row)
+                .await
+                .map(|_| Done::Inserted)
+        });
+    }
+
+    /// Asks the backend, in the background, what the open confirm would run.
+    fn preview<F>(
+        &mut self,
+        op: impl FnOnce(Arc<dyn DataSource>, String, String) -> F + Send + 'static,
+    ) where
+        F: Future<Output = Result<Option<String>>> + Send + 'static,
+    {
+        self.confirm_preview = None;
+        let db = self.current_db().unwrap_or_default().to_string();
+        let container = self.current_container().unwrap_or_default().to_string();
+        let status = std::mem::take(&mut self.status);
+        self.start(&status, false, move |s| async move {
+            // a preview that fails (no primary key...) just isn't shown
+            Ok(Done::Preview(op(s, db, container).await.ok().flatten()))
+        });
+    }
+
+    fn load_schema(&mut self) {
+        let db = self.current_db().unwrap_or_default().to_string();
+        let Some(container) = self.current_container().map(str::to_string) else {
+            return;
+        };
+        self.start("loading schema...", false, move |s| async move {
+            s.describe(&db, &container).await.map(Done::Schema)
+        });
     }
 
     async fn handle_field_edit_key(&mut self, key: KeyEvent) {
@@ -954,8 +1286,9 @@ impl App {
             match key.code {
                 KeyCode::Enter => {
                     let before = crate::value::value_to_input(&fe.edited[&field]);
-                    // untouched text keeps its original type (string "42" stays a string)
-                    if input.value() != before {
+                    // untouched text keeps its original type (string "42" stays a string);
+                    // on a new row, a field left empty stays null (= database default)
+                    if input.value() != before && !(fe.insert && input.value().is_empty()) {
                         let v = crate::value::input_to_value(input.value());
                         fe.edited.insert(field, v);
                     }
@@ -975,13 +1308,22 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => fe.idx = fe.idx.saturating_sub(1),
             KeyCode::Enter => {
-                fe.input = Some(Input::new(crate::value::value_to_input(&fe.edited[&field])))
+                let v = &fe.edited[&field];
+                // a new row's unset field starts empty, not as the text "null"
+                let text = if fe.insert && v.is_null() {
+                    String::new()
+                } else {
+                    crate::value::value_to_input(v)
+                };
+                fe.input = Some(Input::new(text))
             }
             KeyCode::Char('s') if key.ctrl => {
                 let fe = self.field_edit.take().unwrap();
                 self.mode = Mode::Normal;
                 if fe.edited == fe.original {
                     self.status = "no changes".into();
+                } else if fe.insert {
+                    self.insert_row(fe.edited);
                 } else {
                     self.save_row(&fe.original, &fe.edited);
                 }
@@ -1030,8 +1372,11 @@ impl App {
             self.status = "no changes".into();
             return;
         }
-        self.pending_edit = Some((original, edited));
+        self.pending_edit = Some((original.clone(), edited.clone()));
         self.mode = Mode::ConfirmEditSave;
+        self.preview(
+            move |s, db, c| async move { s.preview_update(&db, &c, &original, &edited).await },
+        );
     }
 
     async fn handle_confirm_edit_save_key(&mut self, key: KeyEvent) {
@@ -1301,10 +1646,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Answers after `delay`; records whether a delete went through.
+    /// Answers after `delay`; records whether a delete went through and what was inserted.
     struct Slow {
         delay: Duration,
         deleted: Arc<AtomicBool>,
+        inserted: Arc<std::sync::Mutex<Vec<Row>>>,
     }
 
     #[async_trait::async_trait]
@@ -1318,13 +1664,19 @@ mod tests {
         }
         async fn fetch_rows(&self, _: &str, _: &str, _: i64, _: i64) -> Result<QueryResult> {
             Ok(QueryResult {
-                columns: vec!["id".into()],
-                rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
+                columns: vec!["id".into(), "name".into()],
+                rows: vec![serde_json::from_str(r#"{"id": 1, "name": "a"}"#).unwrap()],
                 affected: None,
             })
         }
         async fn run_query(&self, _: &str, _: &str, _: &str) -> Result<QueryResult> {
             unimplemented!()
+        }
+        fn can_sort(&self) -> bool {
+            true
+        }
+        async fn count_rows(&self, _: &str, _: &str) -> Result<Option<u64>> {
+            Ok(Some(450))
         }
         async fn delete_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
             tokio::time::sleep(self.delay).await;
@@ -1334,6 +1686,28 @@ mod tests {
         async fn update_row(&self, _: &str, _: &str, _: &Row, _: &Row) -> Result<()> {
             Ok(())
         }
+        async fn insert_row(&self, _: &str, _: &str, row: &Row) -> Result<()> {
+            self.inserted.lock().unwrap().push(row.clone());
+            Ok(())
+        }
+        async fn preview_delete(&self, _: &str, c: &str, _: &Row) -> Result<Option<String>> {
+            Ok(Some(format!("DELETE FROM {c} WHERE id = 1")))
+        }
+        async fn metrics(&self, _: &str, _: &str) -> Result<Vec<(String, f64)>> {
+            Ok(vec![("depth".into(), 3.)])
+        }
+        async fn describe(&self, _: &str, _: &str) -> Result<QueryResult> {
+            Ok(QueryResult {
+                columns: vec!["column".into()],
+                rows: vec![serde_json::from_str(r#"{"column": "id"}"#).unwrap()],
+                affected: None,
+            })
+        }
+    }
+
+    thread_local! {
+        /// What the current test's `Slow` source inserted.
+        static INSERTED: Arc<std::sync::Mutex<Vec<Row>>> = Arc::default();
     }
 
     async fn app_with(delay: Duration) -> (App, Arc<AtomicBool>) {
@@ -1347,6 +1721,7 @@ mod tests {
             source: Ok(Arc::new(Slow {
                 delay,
                 deleted: deleted.clone(),
+                inserted: INSERTED.with(|i| i.clone()),
             })),
         });
         app.mode = Mode::Normal;
@@ -1409,7 +1784,138 @@ mod tests {
         assert!(app.is_busy());
         settle(&mut app).await;
         assert!(deleted.load(Ordering::SeqCst));
-        assert_eq!(app.status, "1 rows (offset 0)");
+        assert_eq!(app.status, "1 rows (offset 0) of 450, page 1/3");
+    }
+
+    async fn command(app: &mut App, text: &str) {
+        press(app, KeyCode::Char(':')).await;
+        for c in text.chars() {
+            press(app, KeyCode::Char(c)).await;
+        }
+        press(app, KeyCode::Enter).await;
+        settle(app).await;
+    }
+
+    async fn open_table(app: &mut App) {
+        press(app, KeyCode::Enter).await;
+        settle(app).await;
+        press(app, KeyCode::Enter).await;
+        settle(app).await;
+        app.browse_focus = BrowseFocus::Rows;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_inserts_only_the_fields_that_were_set() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        press(&mut app, KeyCode::Char('a')).await;
+        assert!(app.field_edit.as_ref().is_some_and(|fe| fe.insert));
+        for k in [KeyCode::Enter, KeyCode::Char('7'), KeyCode::Enter] {
+            press(&mut app, k).await;
+        }
+        app.handle_key(KeyEvent::ctrl(KeyCode::Char('s'))).await;
+        settle(&mut app).await;
+        let inserted = INSERTED.with(|i| i.lock().unwrap().clone());
+        assert_eq!(
+            inserted,
+            [serde_json::from_str::<Row>(r#"{"id": 7}"#).unwrap()]
+        );
+        assert!(app.status.starts_with("1 rows"), "reloaded: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_shows_the_statement() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        press(&mut app, KeyCode::Char('d')).await;
+        settle(&mut app).await;
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+        assert_eq!(
+            app.confirm_preview.as_deref(),
+            Some("DELETE FROM t WHERE id = 1")
+        );
+        press(&mut app, KeyCode::Char('n')).await;
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[tokio::test]
+    async fn up_and_down_walk_the_query_history() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        app.history
+            .insert("slow".into(), vec!["select 1".into(), "select 2".into()]);
+        press(&mut app, KeyCode::Char('/')).await;
+        let shown = |app: &App| app.query_input.value().to_string();
+        press(&mut app, KeyCode::Up).await;
+        assert_eq!(shown(&app), "select 2");
+        press(&mut app, KeyCode::Up).await;
+        press(&mut app, KeyCode::Up).await;
+        assert_eq!(shown(&app), "select 1");
+        press(&mut app, KeyCode::Down).await;
+        assert_eq!(shown(&app), "select 2");
+        press(&mut app, KeyCode::Down).await;
+        assert_eq!(shown(&app), "");
+    }
+
+    #[tokio::test]
+    async fn metrics_are_sampled_for_the_open_container() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        for _ in 0..20 {
+            app.poll().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // sampled once (then every METRICS_EVERY), as a named series
+        assert_eq!(app.metrics.len(), 1);
+        assert_eq!(app.metrics[0].0, "depth");
+        assert_eq!(app.metrics[0].1, [3.]);
+        // another screen: series dropped
+        press(&mut app, KeyCode::Esc).await;
+        press(&mut app, KeyCode::Esc).await;
+        app.poll().await;
+        assert!(app.metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn i_shows_the_schema_and_esc_closes_it() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        open_table(&mut app).await;
+        press(&mut app, KeyCode::Char('i')).await;
+        settle(&mut app).await;
+        assert!(matches!(app.mode, Mode::Schema));
+        assert_eq!(app.schema.as_ref().unwrap().rows.len(), 1);
+        press(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn sort_command_orders_rows_server_side() {
+        let (mut app, _) = app_with(Duration::ZERO).await;
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        press(&mut app, KeyCode::Char(':')).await;
+        press(&mut app, KeyCode::Char('s')).await;
+        assert!(app.command_matches().contains(&"sort id desc".to_string()));
+        press(&mut app, KeyCode::Esc).await;
+
+        command(&mut app, "sort id desc").await;
+        assert_eq!(
+            app.sort.as_ref().map(|s| (s.column.as_str(), s.desc)),
+            Some(("id", true))
+        );
+        assert_eq!(
+            app.status,
+            "1 rows (offset 0) of 450, page 1/3, sorted by id ↓"
+        );
+        command(&mut app, "sort nope").await;
+        assert_eq!(app.status, "error: no column 'nope' here");
+        command(&mut app, "sort id sideways").await;
+        assert!(app.status.contains("not asc or desc"));
+        command(&mut app, "sort").await;
+        assert_eq!(app.sort, None);
     }
 
     #[test]

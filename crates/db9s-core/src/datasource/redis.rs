@@ -91,6 +91,14 @@ impl RedisSource {
     }
 }
 
+/// A numeric `field:value` line of INFO output; 0 when absent.
+fn info_field(info: &str, field: &str) -> f64 {
+    info.lines()
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0.)
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -194,6 +202,22 @@ fn is_read_command(raw: &str) -> bool {
 impl DataSource for RedisSource {
     fn is_read_query(&self, raw: &str) -> bool {
         is_read_command(raw)
+    }
+
+    /// Server-wide memory and load, plus this database's key count.
+    async fn metrics(&self, db: &str, _key: &str) -> Result<Vec<(String, f64)>> {
+        let mut con = self.conn(db).await?;
+        let info: String = cmd("INFO").query_async(&mut con).await?;
+        let keys: f64 = cmd("DBSIZE").query_async(&mut con).await?;
+        Ok(vec![
+            ("memory MB".into(), info_field(&info, "used_memory") / 1e6),
+            (
+                "ops/s".into(),
+                info_field(&info, "instantaneous_ops_per_sec"),
+            ),
+            ("keys".into(), keys),
+            ("clients".into(), info_field(&info, "connected_clients")),
+        ])
     }
 
     /// db0 plus every non-empty logical database (CONFIG is often disabled on managed Redis).
@@ -444,7 +468,14 @@ impl DataSource for RedisSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_read_command, split_command};
+    use super::{info_field, is_read_command, split_command};
+
+    #[test]
+    fn reads_info_fields() {
+        let info = "# Memory\r\nused_memory:1048576\r\nused_memory_human:1.00M\r\n";
+        assert_eq!(info_field(info, "used_memory"), 1048576.);
+        assert_eq!(info_field(info, "connected_clients"), 0.);
+    }
 
     #[test]
     fn splits_commands_like_a_shell() {

@@ -10,7 +10,7 @@
 //!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 use super::{
     amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
-    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource, QueryResult, ReadOnly,
+    rabbitmq::RabbitMqSource, redis::RedisSource, DataSource, QueryResult, ReadOnly, Sort,
 };
 use crate::value::Row;
 use anyhow::Result;
@@ -46,6 +46,19 @@ async fn exercise(source: &dyn DataSource, db: &str, container: &str, query_for_
     let paged = source.fetch_rows(db, container, 1, 1).await.unwrap();
     assert_eq!(paged.rows.len(), 1);
 
+    assert!(source.can_sort());
+    let by_name_desc = Sort {
+        column: "name".into(),
+        desc: true,
+    };
+    let sorted = source
+        .fetch_sorted(db, container, 10, 0, &by_name_desc)
+        .await
+        .unwrap();
+    let names: Vec<_> = sorted.rows.iter().map(|r| r["name"].clone()).collect();
+    assert_eq!(names, [json!("b"), json!("a")]);
+    assert_eq!(source.count_rows(db, container).await.unwrap(), Some(2));
+
     let row_a = res.rows.iter().find(|r| r["name"] == json!("a")).unwrap();
     let mut edited = row_a.clone();
     edited.insert("name".into(), json!("z"));
@@ -60,11 +73,68 @@ async fn exercise(source: &dyn DataSource, db: &str, container: &str, query_for_
 
     let res = source.fetch_rows(db, container, 10, 0).await.unwrap();
     let row_b = res.rows.iter().find(|r| r["name"] == json!("b")).unwrap();
+    let shown = source.preview_delete(db, container, row_b).await.unwrap();
+    assert!(shown.is_some_and(|s| s.contains(container)));
     source.delete_row(db, container, row_b).await.unwrap();
 
     let res = source.fetch_rows(db, container, 10, 0).await.unwrap();
     assert_eq!(res.rows.len(), 1);
     assert_eq!(res.rows[0]["name"], json!("z"));
+
+    // only `name`: the id comes from the database
+    let mut new_row = crate::value::Row::new();
+    new_row.insert("name".into(), json!("y"));
+    source.insert_row(db, container, &new_row).await.unwrap();
+    let res = source.fetch_rows(db, container, 10, 0).await.unwrap();
+    assert!(res.rows.iter().any(|r| r["name"] == json!("y")));
+    assert_eq!(res.rows.len(), 2);
+
+    let schema = source.describe(db, container).await.unwrap();
+    assert!(
+        schema.rows.iter().any(|r| r.values().any(|v| v == "name")),
+        "{:?}",
+        schema.rows
+    );
+}
+
+/// Needs no server: a throwaway file, so it always runs.
+#[tokio::test]
+async fn sqlite_conformance() {
+    use super::sqlite::SqliteSource;
+    let path = std::env::temp_dir().join(format!("{}.db", unique("db9s_test")));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let table = "items";
+    {
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!("INSERT INTO {table} (name) VALUES ('a'), ('b')"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let source = SqliteSource::connect(&url, false).await.unwrap();
+    let query = format!("SELECT * FROM {table} WHERE name = 'z'");
+    exercise(&source, "main", table, &query).await;
+
+    let schema = source.describe("main", table).await.unwrap();
+    let id = schema
+        .rows
+        .iter()
+        .find(|r| r["column"] == json!("id"))
+        .unwrap();
+    assert_eq!(id["key"], json!("PK"));
+    assert_eq!(id["type"], json!("INTEGER"));
+
+    // read-only is enforced by SQLite itself, raw queries included
+    let ro = SqliteSource::connect(&url, true).await.unwrap();
+    let write = format!("DELETE FROM {table}");
+    assert!(ro.run_query("main", table, &write).await.is_err());
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -165,6 +235,11 @@ async fn mongo_conformance() {
 /// paginate, read-only edit, purge. Expects `queue` to exist, empty, in vhost "/".
 async fn exercise_queue(source: &dyn DataSource, queue: &str) {
     assert!(source.is_queue());
+    let metrics = source.metrics("/", queue).await.unwrap();
+    assert!(
+        metrics.iter().any(|(name, _)| name == "ready"),
+        "{metrics:?}"
+    );
     assert!(source
         .list_databases()
         .await
@@ -301,6 +376,11 @@ async fn redis_conformance() {
         return;
     };
     let source = RedisSource::connect(&url).await.unwrap();
+    let metrics = source.metrics("db0", "").await.unwrap();
+    assert!(
+        metrics.iter().any(|(n, v)| n == "memory MB" && *v > 0.),
+        "{metrics:?}"
+    );
     let p = unique("db9s_test");
     let k = |t: &str| format!("{p}:{t}");
     let db = "db0";
