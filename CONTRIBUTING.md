@@ -12,6 +12,9 @@ cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mysql mysql:
   --redis redis://localhost:56379 --rabbitmq http://db9s:db9s@localhost:55672
 ```
 
+The desktop GUI (`crates/db9s-gui`, GPUI, early) reads the same config.toml and is
+left out of the default build: `cargo run -p db9s-gui` (`--read-only` works too).
+
 ## Before opening a PR
 
 ```bash
@@ -22,7 +25,7 @@ DB9S_TEST_MYSQL_URL=mysql://db9s:db9s@localhost:53306/db9s \
 DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
 DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
-DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test --workspace
+DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 ```
 
 `crates/db9s-core/src/datasource/tests.rs` runs the same scenario (list, page, update, query,

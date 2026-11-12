@@ -7,7 +7,7 @@
 //!   DB9S_TEST_MONGO_URL=mongodb://localhost:57017 \
 //!   DB9S_TEST_RABBITMQ_URL=http://db9s:db9s@localhost:55672 \
 //!   DB9S_TEST_AMQP_URL=amqp://db9s:db9s@localhost:55673/%2F \
-//!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test --workspace
+//!   DB9S_TEST_REDIS_URL=redis://localhost:56379 cargo test
 use super::{
     amqp::AmqpSource, mongo::MongoSource, mysql::MySqlSource, postgres::PostgresSource,
     rabbitmq::RabbitMqSource, redis::RedisSource, DataSource, QueryResult, ReadOnly,

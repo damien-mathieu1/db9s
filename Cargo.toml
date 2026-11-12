@@ -1,5 +1,7 @@
 [workspace]
-members = ["crates/db9s-core"]
+members = ["crates/db9s-core", "crates/db9s-gui"]
+# the GUI (GPUI) is slow to build and needs system libs on Linux: opt in with -p db9s-gui
+default-members = [".", "crates/db9s-core"]
 
 [workspace.package]
 version = "2026.11.3"
