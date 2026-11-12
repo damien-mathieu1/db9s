@@ -4,18 +4,21 @@ use db9s_core::input::Input;
 use db9s_core::key::{KeyCode, KeyEvent};
 use db9s_core::theme::{self, BorderType, Color};
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, Application, Bounds, Context, Div, FocusHandle,
-    Hsla, KeyDownEvent, Keystroke, ScrollStrategy, SharedString, Task, UniformListScrollHandle,
-    Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, uniform_list, Application, Bounds, Context, CursorStyle, Div,
+    FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions,
 };
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
 const BG: u32 = 0x1a1b1e;
 const FG: u32 = 0xd4d4d4;
 const LINE_HEIGHT: f32 = 20.;
-/// 4 field lines + py_1 (8) + border (2) + pb_1 gap (4), with a little slack.
-const CARD_HEIGHT: f32 = 4. * LINE_HEIGHT + 18.;
+/// Menlo advance at text_sm (14px), to size columns from their content.
+const CHAR_WIDTH: f32 = 8.5;
+const MIN_COL_WIDTH: f32 = 40.;
 
 fn main() {
     let read_only = std::env::args().any(|a| a == "--read-only");
@@ -50,6 +53,10 @@ struct Db9s {
     db_scroll: UniformListScrollHandle,
     container_scroll: UniformListScrollHandle,
     row_scroll: UniformListScrollHandle,
+    /// Widths the user dragged, by column name; others are sized from their content.
+    col_widths: HashMap<String, f32>,
+    /// Column being resized: (name, mouse x and column width when the drag started).
+    resizing: Option<(String, f32, f32)>,
     _poll: Task<()>,
 }
 
@@ -78,6 +85,8 @@ impl Db9s {
             db_scroll: Default::default(),
             container_scroll: Default::default(),
             row_scroll: Default::default(),
+            col_widths: HashMap::new(),
+            resizing: None,
             _poll: poll,
         }
     }
@@ -359,6 +368,11 @@ impl Render for Db9s {
         let mut root = div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_mouse_move(cx.listener(Self::on_resize_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.resizing = None),
+            )
             .size_full()
             .relative()
             .flex()
@@ -386,7 +400,7 @@ impl Render for Db9s {
                     &p,
                 ))
                 .into_any_element(),
-            Screen::Browse => self.browse(&p).into_any_element(),
+            Screen::Browse => self.browse(&p, cx).into_any_element(),
         };
         root = root.child(body).child(footer(app, &p));
         if let Some(modal) = modal(app, &p) {
@@ -405,7 +419,7 @@ impl Render for Db9s {
 }
 
 impl Db9s {
-    fn browse(&self, p: &Palette) -> Div {
+    fn browse(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let app = &self.app;
         let containers_focused = app.browse_focus == BrowseFocus::Containers;
         let focus_color = |f: bool| if f { p.border_focus } else { p.border_blur };
@@ -427,7 +441,7 @@ impl Db9s {
         ));
         let right = match &app.field_edit {
             Some(fe) => field_editor(fe, p),
-            None => self.rows(!containers_focused, p),
+            None => self.grid(!containers_focused, p, cx),
         };
         div()
             .flex()
@@ -439,8 +453,33 @@ impl Db9s {
             .child(right.flex_1())
     }
 
-    /// One card per row/document, up to 4 `field: value` lines, like the TUI.
-    fn rows(&self, focused: bool, p: &Palette) -> Div {
+    /// Width of a column: what the user dragged it to, else `auto_width`.
+    fn col_width(&self, col: &str, rows: &[db9s_core::value::Row]) -> f32 {
+        self.col_widths
+            .get(col)
+            .copied()
+            .unwrap_or_else(|| auto_width(col, rows))
+    }
+}
+
+/// A column sized to its name and the first rows' values, capped so one long JSON
+/// blob doesn't take the whole screen.
+fn auto_width(col: &str, rows: &[db9s_core::value::Row]) -> f32 {
+    let longest = rows
+        .iter()
+        .take(50)
+        .filter_map(|r| r.get(col))
+        .map(|v| compact(v).chars().count())
+        .chain([col.chars().count()])
+        .max()
+        .unwrap_or(0);
+    (longest.clamp(4, 40) as f32 * CHAR_WIDTH + 16.).max(MIN_COL_WIDTH)
+}
+
+impl Db9s {
+    /// Rows as a grid: one line per row, one resizable column per field, scrolling both
+    /// ways; only the visible rows are laid out.
+    fn grid(&self, focused: bool, p: &Palette, cx: &mut Context<Self>) -> Div {
         let app = &self.app;
         let title = match &app.result {
             Some(res) => format!("rows  (offset {}, showing {})", app.offset, res.rows.len()),
@@ -461,53 +500,128 @@ impl Db9s {
         if res.rows.is_empty() {
             return outer.child("no rows");
         }
-        let cards: Vec<Vec<Vec<Span>>> = res
-            .rows
+        let widths: Vec<f32> = res
+            .columns
             .iter()
-            .map(|row| {
-                res.columns
-                    .iter()
-                    .take(4)
-                    .map(|col| {
-                        let val = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
-                        vec![
-                            styled(format!("{col}: "), p.field_name).bold(),
-                            raw(compact(&val)),
-                        ]
-                    })
-                    .collect()
-            })
+            .map(|c| self.col_width(c, &res.rows))
             .collect();
+        let total: f32 = widths.iter().sum();
+        let header = div()
+            .flex()
+            .flex_row()
+            .w(px(total))
+            .border_b_1()
+            .border_color(p.border_blur)
+            .children(res.columns.iter().zip(&widths).map(|(col, w)| {
+                let (col_name, w) = (col.clone(), *w);
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .w(px(w))
+                    .px_1()
+                    .truncate()
+                    .text_color(p.field_name)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(col.clone())
+                    .child(
+                        // drag handle on the right edge
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .w(px(6.))
+                            .cursor(CursorStyle::ResizeColumn)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                    this.resizing =
+                                        Some((col_name.clone(), f32::from(ev.position.x), w));
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+            }));
+
         self.row_scroll
             .scroll_to_item(app.row_idx, ScrollStrategy::Top);
-        let cards = Rc::new(cards);
-        let selected = focused.then_some(app.row_idx);
-        let (focus, blur, rounded) = (p.border_focus, p.border_blur, p.rounded);
-        outer.child(
-            uniform_list("rows", cards.len(), move |range, _, _| {
+        let widths = Rc::new(widths);
+        let body = uniform_list(
+            "rows",
+            res.rows.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let p = palette();
+                let app = &this.app;
+                let Some(res) = &app.result else {
+                    return vec![];
+                };
+                let selected = (app.browse_focus == BrowseFocus::Rows).then_some(app.row_idx);
                 range
-                    .map(|i| {
-                        let card = div().h(px(CARD_HEIGHT)).pb_1().child(
-                            div()
-                                .size_full()
-                                .border_1()
-                                .border_color(if selected == Some(i) { focus } else { blur })
-                                .px_2()
-                                .py_1()
-                                .overflow_hidden()
-                                .children(cards[i].iter().cloned().map(line)),
-                        );
-                        if rounded {
-                            card.rounded_md()
+                    .filter_map(|i| Some((i, res.rows.get(i)?)))
+                    .map(|(i, row)| {
+                        let cells = res.columns.iter().zip(widths.iter()).map(|(col, w)| {
+                            let cell = div().flex_shrink_0().w(px(*w)).px_1().truncate();
+                            match row.get(col) {
+                                None | Some(serde_json::Value::Null) => {
+                                    cell.text_color(p.muted).child("null")
+                                }
+                                Some(v) => cell.child(compact(v)),
+                            }
+                        });
+                        let r = div()
+                            .id(i)
+                            .flex()
+                            .flex_row()
+                            .w(px(total))
+                            .children(cells)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app.row_idx = i;
+                                this.app.browse_focus = BrowseFocus::Rows;
+                                cx.notify();
+                            }));
+                        if selected == Some(i) {
+                            r.text_color(p.selected_fg).bg(p.selected_bg)
                         } else {
-                            card
+                            r
                         }
                     })
                     .collect()
-            })
-            .track_scroll(self.row_scroll.clone())
-            .flex_1(),
+            }),
         )
+        .track_scroll(self.row_scroll.clone())
+        .w(px(total))
+        .flex_1();
+
+        outer.child(
+            div()
+                .id("grid")
+                .flex_1()
+                .min_h_0()
+                .overflow_x_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .h_full()
+                        .w(px(total))
+                        .child(header)
+                        .child(body),
+                ),
+        )
+    }
+
+    fn on_resize_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((col, x0, w0)) = &self.resizing else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            // released outside the window
+            self.resizing = None;
+            return;
+        }
+        let w = (w0 + f32::from(ev.position.x) - x0).max(MIN_COL_WIDTH);
+        self.col_widths.insert(col.clone(), w);
+        cx.notify();
     }
 }
 
@@ -876,6 +990,21 @@ mod tests {
         );
         assert_eq!(code(ks("f1", None, |_| ())), Some((KeyCode::Other, false)));
         assert_eq!(code(ks("q", Some("q"), |m| m.platform = true)), None);
+    }
+
+    #[test]
+    fn columns_fit_their_content_within_bounds() {
+        let rows: Vec<db9s_core::value::Row> = vec![
+            serde_json::from_str(r#"{"id": 1, "bio": "x"}"#).unwrap(),
+            serde_json::from_str(&format!(r#"{{"id": 22, "bio": "{}"}}"#, "y".repeat(500)))
+                .unwrap(),
+        ];
+        assert_eq!(auto_width("id", &rows), 4. * CHAR_WIDTH + 16.);
+        assert_eq!(auto_width("bio", &rows), 40. * CHAR_WIDTH + 16.);
+        assert_eq!(
+            auto_width("a_long_column_name", &[]),
+            18. * CHAR_WIDTH + 16.
+        );
     }
 
     #[test]
