@@ -537,9 +537,14 @@ impl App {
         }
     }
 
+    /// Every candidate extending what's typed, best first; `command_idx` picks one.
+    pub fn command_matches(&self) -> Vec<String> {
+        complete(&self.command_candidates(), self.command_input.value())
+    }
+
     /// The full candidate currently suggested for what's typed, if any.
     fn command_choice(&self) -> Option<String> {
-        let matches = complete(&self.command_candidates(), self.command_input.value());
+        let matches = self.command_matches();
         (!matches.is_empty()).then(|| matches[self.command_idx % matches.len()].clone())
     }
 
@@ -562,8 +567,9 @@ impl App {
                 self.command_input = Input::new(self.command_choice().unwrap());
                 self.command_idx = 0;
             }
-            KeyCode::Up => self.command_idx += 1,
-            KeyCode::Down => self.command_idx = self.command_idx.saturating_sub(1),
+            // down = next, so the GUI's top-down suggestion list moves the way the arrow points
+            KeyCode::Down => self.command_idx += 1,
+            KeyCode::Up => self.command_idx = self.command_idx.saturating_sub(1),
             _ => {
                 self.command_input.handle(key);
                 self.command_idx = 0;

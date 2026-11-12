@@ -4,18 +4,21 @@ use db9s_core::input::Input;
 use db9s_core::key::{KeyCode, KeyEvent};
 use db9s_core::theme::{self, BorderType, Color};
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, Application, Bounds, Context, Div, FocusHandle,
-    Hsla, KeyDownEvent, Keystroke, ScrollStrategy, SharedString, Task, UniformListScrollHandle,
-    Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, uniform_list, Application, Bounds, Context, CursorStyle, Div,
+    FocusHandle, Hsla, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions,
 };
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
 const BG: u32 = 0x1a1b1e;
 const FG: u32 = 0xd4d4d4;
 const LINE_HEIGHT: f32 = 20.;
-/// 4 field lines + py_1 (8) + border (2) + pb_1 gap (4), with a little slack.
-const CARD_HEIGHT: f32 = 4. * LINE_HEIGHT + 18.;
+/// Menlo advance at text_sm (14px), to size columns from their content.
+const CHAR_WIDTH: f32 = 8.5;
+const MIN_COL_WIDTH: f32 = 40.;
 
 fn main() {
     let read_only = std::env::args().any(|a| a == "--read-only");
@@ -50,6 +53,14 @@ struct Db9s {
     db_scroll: UniformListScrollHandle,
     container_scroll: UniformListScrollHandle,
     row_scroll: UniformListScrollHandle,
+    /// Widths the user dragged, by column name; others are sized from their content.
+    col_widths: HashMap<String, f32>,
+    /// Column being resized: (name, mouse x and column width when the drag started).
+    resizing: Option<(String, f32, f32)>,
+    /// Inspector nodes unfolded by a click, by path (everything starts folded).
+    /// Kept across rows, so the same field stays open while moving through a table.
+    unfolded: HashSet<String>,
+    tree_scroll: UniformListScrollHandle,
     _poll: Task<()>,
 }
 
@@ -78,6 +89,10 @@ impl Db9s {
             db_scroll: Default::default(),
             container_scroll: Default::default(),
             row_scroll: Default::default(),
+            col_widths: HashMap::new(),
+            resizing: None,
+            unfolded: HashSet::new(),
+            tree_scroll: Default::default(),
             _poll: poll,
         }
     }
@@ -359,6 +374,11 @@ impl Render for Db9s {
         let mut root = div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_mouse_move(cx.listener(Self::on_resize_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.resizing = None),
+            )
             .size_full()
             .relative()
             .flex()
@@ -373,6 +393,9 @@ impl Render for Db9s {
             .child(header(app, &p));
         if matches!(app.mode, Mode::Command) {
             root = root.child(command_prompt(app, &p));
+            if let Some(list) = self.command_palette(&p, cx) {
+                root = root.child(list);
+            }
         }
         let body = match app.screen {
             Screen::Connections => connections(app, &self.conn_scroll, &p).into_any_element(),
@@ -386,7 +409,7 @@ impl Render for Db9s {
                     &p,
                 ))
                 .into_any_element(),
-            Screen::Browse => self.browse(&p).into_any_element(),
+            Screen::Browse => self.browse(&p, cx).into_any_element(),
         };
         root = root.child(body).child(footer(app, &p));
         if let Some(modal) = modal(app, &p) {
@@ -405,7 +428,7 @@ impl Render for Db9s {
 }
 
 impl Db9s {
-    fn browse(&self, p: &Palette) -> Div {
+    fn browse(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let app = &self.app;
         let containers_focused = app.browse_focus == BrowseFocus::Containers;
         let focus_color = |f: bool| if f { p.border_focus } else { p.border_blur };
@@ -425,9 +448,22 @@ impl Db9s {
             &self.container_scroll,
             p,
         ));
-        let right = match &app.field_edit {
+        // the row being edited shows in the grid; the panel below lists every field,
+        // including ones the grid has no column for
+        let below = match &app.field_edit {
             Some(fe) => field_editor(fe, p),
-            None => self.rows(!containers_focused, p),
+            None => self.inspector(p, cx),
+        };
+        let right = if containers_focused {
+            self.grid(false, p, cx)
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .min_h_0()
+                .child(self.grid(true, p, cx).flex_1().min_h_0())
+                .child(below.h_2_5())
         };
         div()
             .flex()
@@ -439,8 +475,33 @@ impl Db9s {
             .child(right.flex_1())
     }
 
-    /// One card per row/document, up to 4 `field: value` lines, like the TUI.
-    fn rows(&self, focused: bool, p: &Palette) -> Div {
+    /// Width of a column: what the user dragged it to, else `auto_width`.
+    fn col_width(&self, col: &str, rows: &[db9s_core::value::Row]) -> f32 {
+        self.col_widths
+            .get(col)
+            .copied()
+            .unwrap_or_else(|| auto_width(col, rows))
+    }
+}
+
+/// A column sized to its name and the first rows' values, capped so one long JSON
+/// blob doesn't take the whole screen.
+fn auto_width(col: &str, rows: &[db9s_core::value::Row]) -> f32 {
+    let longest = rows
+        .iter()
+        .take(50)
+        .filter_map(|r| r.get(col))
+        .map(|v| compact(v).chars().count())
+        .chain([col.chars().count()])
+        .max()
+        .unwrap_or(0);
+    (longest.clamp(4, 40) as f32 * CHAR_WIDTH + 16.).max(MIN_COL_WIDTH)
+}
+
+impl Db9s {
+    /// Rows as a grid: one line per row, one resizable column per field, scrolling both
+    /// ways; only the visible rows are laid out.
+    fn grid(&self, focused: bool, p: &Palette, cx: &mut Context<Self>) -> Div {
         let app = &self.app;
         let title = match &app.result {
             Some(res) => format!("rows  (offset {}, showing {})", app.offset, res.rows.len()),
@@ -461,53 +522,347 @@ impl Db9s {
         if res.rows.is_empty() {
             return outer.child("no rows");
         }
-        let cards: Vec<Vec<Vec<Span>>> = res
-            .rows
+        let widths: Vec<f32> = res
+            .columns
             .iter()
-            .map(|row| {
-                res.columns
-                    .iter()
-                    .take(4)
-                    .map(|col| {
-                        let val = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
-                        vec![
-                            styled(format!("{col}: "), p.field_name).bold(),
-                            raw(compact(&val)),
-                        ]
-                    })
-                    .collect()
-            })
+            .map(|c| self.col_width(c, &res.rows))
             .collect();
+        let total: f32 = widths.iter().sum();
+        let header = div()
+            .flex()
+            .flex_row()
+            .w(px(total))
+            .border_b_1()
+            .border_color(p.border_blur)
+            .children(res.columns.iter().zip(&widths).map(|(col, w)| {
+                let (col_name, w) = (col.clone(), *w);
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .w(px(w))
+                    .px_1()
+                    .truncate()
+                    .text_color(p.field_name)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(col.clone())
+                    .child(
+                        // drag handle on the right edge
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .w(px(6.))
+                            .cursor(CursorStyle::ResizeColumn)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                    this.resizing =
+                                        Some((col_name.clone(), f32::from(ev.position.x), w));
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+            }));
+
         self.row_scroll
             .scroll_to_item(app.row_idx, ScrollStrategy::Top);
-        let cards = Rc::new(cards);
-        let selected = focused.then_some(app.row_idx);
-        let (focus, blur, rounded) = (p.border_focus, p.border_blur, p.rounded);
-        outer.child(
-            uniform_list("rows", cards.len(), move |range, _, _| {
+        let widths = Rc::new(widths);
+        let body = uniform_list(
+            "rows",
+            res.rows.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let p = palette();
+                let app = &this.app;
+                let Some(res) = &app.result else {
+                    return vec![];
+                };
+                let selected = (app.browse_focus == BrowseFocus::Rows).then_some(app.row_idx);
                 range
-                    .map(|i| {
-                        let card = div().h(px(CARD_HEIGHT)).pb_1().child(
-                            div()
-                                .size_full()
-                                .border_1()
-                                .border_color(if selected == Some(i) { focus } else { blur })
-                                .px_2()
-                                .py_1()
-                                .overflow_hidden()
-                                .children(cards[i].iter().cloned().map(line)),
-                        );
-                        if rounded {
-                            card.rounded_md()
+                    .filter_map(|i| Some((i, res.rows.get(i)?)))
+                    .map(|(i, row)| {
+                        // the selected row, while field-edited, shows its pending values
+                        let fe = app.field_edit.as_ref().filter(|_| selected == Some(i));
+                        let row = fe.map_or(row, |fe| &fe.edited);
+                        let current = fe.and_then(|fe| fe.edited.keys().nth(fe.idx));
+                        let cells = res.columns.iter().zip(widths.iter()).map(|(col, w)| {
+                            let cell = div().flex_shrink_0().w(px(*w)).px_1().truncate();
+                            let cell = match fe {
+                                Some(fe) if fe.original.get(col) != fe.edited.get(col) => {
+                                    cell.text_color(p.success)
+                                }
+                                _ => cell,
+                            };
+                            if let Some(fe) = fe.filter(|_| current == Some(col)) {
+                                let content = match &fe.input {
+                                    Some(input) => line(input_spans(input, true)),
+                                    None => line(vec![raw(row
+                                        .get(col)
+                                        .map(compact)
+                                        .unwrap_or_default())]),
+                                };
+                                // no border: uniform_list needs every row the same height
+                                return cell
+                                    .bg(rgb(BG))
+                                    .text_color(p.border_focus)
+                                    .debug_selector(|| format!("cell-edit-{col}"))
+                                    .child(content);
+                            }
+                            match row.get(col) {
+                                None | Some(serde_json::Value::Null) => {
+                                    cell.text_color(p.muted).child("null")
+                                }
+                                Some(v) => cell.child(compact(v)),
+                            }
+                        });
+                        let r = div()
+                            .id(i)
+                            .flex()
+                            .flex_row()
+                            .w(px(total))
+                            .children(cells)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app.row_idx = i;
+                                this.app.browse_focus = BrowseFocus::Rows;
+                                cx.notify();
+                            }));
+                        if selected == Some(i) {
+                            r.text_color(p.selected_fg).bg(p.selected_bg)
                         } else {
-                            card
+                            r
                         }
                     })
                     .collect()
-            })
-            .track_scroll(self.row_scroll.clone())
+            }),
+        )
+        .track_scroll(self.row_scroll.clone())
+        .w(px(total))
+        .flex_1();
+
+        outer.child(
+            div()
+                .id("grid")
+                .flex_1()
+                .min_h_0()
+                .overflow_x_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .h_full()
+                        .w(px(total))
+                        .child(header)
+                        .child(body),
+                ),
+        )
+    }
+
+    /// The selected row as a foldable JSON tree; click an object/array line to (un)fold it.
+    fn inspector(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let outer = pane("inspect  (click ▸ to unfold)", p.border_blur, p);
+        let Some(row) = self
+            .app
+            .result
+            .as_ref()
+            .and_then(|r| r.rows.get(self.app.row_idx))
+        else {
+            return outer;
+        };
+        let lines = Rc::new(flatten(row, &self.unfolded));
+        outer.child(
+            uniform_list(
+                "inspect",
+                lines.len(),
+                cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                    let p = palette();
+                    range
+                        .map(|i| {
+                            let l = &lines[i];
+                            let mut spans = vec![raw("  ".repeat(l.depth))];
+                            if let Some((open, _)) = &l.fold {
+                                spans.push(styled(if *open { "▾ " } else { "▸ " }, p.muted));
+                            }
+                            if let Some(k) = &l.key {
+                                spans.push(styled(format!("{k}: "), p.field_name).bold());
+                            }
+                            spans.push(match &l.leaf {
+                                Some(v) => leaf_span(v, &p),
+                                None => styled(l.summary.clone(), p.muted),
+                            });
+                            let key = l.key.clone().unwrap_or_default();
+                            let d = line(spans).id(i).debug_selector(|| format!("tree-{key}"));
+                            match &l.fold {
+                                Some((_, path)) => {
+                                    let path = path.clone();
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if !this.unfolded.remove(&path) {
+                                                this.unfolded.insert(path.clone());
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                }
+                                None => d,
+                            }
+                        })
+                        .collect()
+                }),
+            )
+            .track_scroll(self.tree_scroll.clone())
             .flex_1(),
         )
+    }
+
+    /// Every `:` match under the command bar, the current one highlighted (↑/↓ move,
+    /// tab completes, enter runs what's typed, as in the TUI); a click runs that match.
+    fn command_palette(&self, p: &Palette, cx: &mut Context<Self>) -> Option<Div> {
+        const SHOWN: usize = 8;
+        let matches = self.app.command_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let sel = self.app.command_idx % matches.len();
+        let start = sel.saturating_sub(SHOWN - 1);
+        let typed = self.app.command_input.value().chars().count();
+        let items = matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(SHOWN)
+            .map(|(i, m)| {
+                let head: String = m.chars().take(typed).collect();
+                let tail: String = m.chars().skip(typed).collect();
+                let row = line(vec![raw(head).bold(), styled(tail, p.muted)])
+                    .px_1()
+                    .id(i)
+                    .debug_selector(|| format!("palette-{m}"))
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let m = m.clone();
+                        move |this, _, _, cx| {
+                            this.app.command_input = Input::new(m.clone());
+                            this.rt
+                                .block_on(this.app.handle_key(KeyEvent::new(KeyCode::Enter)));
+                            cx.notify();
+                        }
+                    }));
+                if i == sel {
+                    row.text_color(p.selected_fg).bg(p.selected_bg)
+                } else {
+                    row
+                }
+            });
+        let more = matches.len().saturating_sub(start + SHOWN);
+        Some(
+            pane(format!("{} matches", matches.len()), p.border_blur, p)
+                .children(items)
+                .children(
+                    (more > 0).then(|| line(vec![styled(format!("… {more} more"), p.muted)])),
+                ),
+        )
+    }
+
+    fn on_resize_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((col, x0, w0)) = &self.resizing else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            // released outside the window
+            self.resizing = None;
+            return;
+        }
+        let w = (w0 + f32::from(ev.position.x) - x0).max(MIN_COL_WIDTH);
+        self.col_widths.insert(col.clone(), w);
+        cx.notify();
+    }
+}
+
+/// One line of the inspector tree.
+#[derive(Debug, PartialEq)]
+struct TreeLine {
+    depth: usize,
+    /// Field name or array index.
+    key: Option<String>,
+    /// Scalars only.
+    leaf: Option<serde_json::Value>,
+    /// Objects/arrays: whether shown unfolded, and the path that toggles it.
+    fold: Option<(bool, String)>,
+    /// What a folded or empty container shows, e.g. `{3 fields}` / `[]`.
+    summary: String,
+}
+
+/// Flattens a row into visible tree lines; objects/arrays show their content only when
+/// their path (`/key/0/key`) is in `unfolded`.
+fn flatten(row: &db9s_core::value::Row, unfolded: &HashSet<String>) -> Vec<TreeLine> {
+    fn walk(
+        key: String,
+        v: &serde_json::Value,
+        path: String,
+        depth: usize,
+        unfolded: &HashSet<String>,
+        out: &mut Vec<TreeLine>,
+    ) {
+        use serde_json::Value;
+        let children: Vec<(String, &Value)> = match v {
+            Value::Object(m) => m.iter().map(|(k, v)| (k.clone(), v)).collect(),
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v))
+                .collect(),
+            _ => {
+                out.push(TreeLine {
+                    depth,
+                    key: Some(key),
+                    leaf: Some(v.clone()),
+                    fold: None,
+                    summary: String::new(),
+                });
+                return;
+            }
+        };
+        let (open_c, close_c, unit) = if v.is_object() {
+            ('{', '}', "field")
+        } else {
+            ('[', ']', "item")
+        };
+        let plural = if children.len() == 1 { "" } else { "s" };
+        let open = !children.is_empty() && unfolded.contains(&path);
+        let summary = if children.is_empty() {
+            format!("{open_c}{close_c}")
+        } else if open {
+            open_c.to_string()
+        } else {
+            format!("{open_c}{} {unit}{plural}{close_c}", children.len())
+        };
+        out.push(TreeLine {
+            depth,
+            key: Some(key),
+            leaf: None,
+            fold: (!children.is_empty()).then(|| (open, path.clone())),
+            summary,
+        });
+        if open {
+            for (k, child) in children {
+                let child_path = format!("{path}/{k}");
+                walk(k, child, child_path, depth + 1, unfolded, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    for (k, v) in row {
+        walk(k.clone(), v, format!("/{k}"), 0, unfolded, &mut out);
+    }
+    out
+}
+
+fn leaf_span(v: &serde_json::Value, p: &Palette) -> Span {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => styled(format!("{s:?}"), p.success),
+        Value::Number(n) => styled(n.to_string(), p.key_hint),
+        other => styled(other.to_string(), p.muted),
     }
 }
 
@@ -876,6 +1231,157 @@ mod tests {
         );
         assert_eq!(code(ks("f1", None, |_| ())), Some((KeyCode::Other, false)));
         assert_eq!(code(ks("q", Some("q"), |m| m.platform = true)), None);
+    }
+
+    #[test]
+    fn columns_fit_their_content_within_bounds() {
+        let rows: Vec<db9s_core::value::Row> = vec![
+            serde_json::from_str(r#"{"id": 1, "bio": "x"}"#).unwrap(),
+            serde_json::from_str(&format!(r#"{{"id": 22, "bio": "{}"}}"#, "y".repeat(500)))
+                .unwrap(),
+        ];
+        assert_eq!(auto_width("id", &rows), 4. * CHAR_WIDTH + 16.);
+        assert_eq!(auto_width("bio", &rows), 40. * CHAR_WIDTH + 16.);
+        assert_eq!(
+            auto_width("a_long_column_name", &[]),
+            18. * CHAR_WIDTH + 16.
+        );
+    }
+
+    #[test]
+    fn tree_starts_folded_and_unfolds_by_path() {
+        let row: db9s_core::value::Row = serde_json::from_str(
+            r#"{"id": 7, "tags": [], "addr": {"city": "Lyon", "geo": {"lat": 45.7}}}"#,
+        )
+        .unwrap();
+        let show = |unfolded: &[&str]| -> Vec<String> {
+            let u = unfolded.iter().map(|s| s.to_string()).collect();
+            flatten(&row, &u)
+                .into_iter()
+                .map(|l| {
+                    let v = l.leaf.map(|v| v.to_string()).unwrap_or(l.summary);
+                    format!("{}{}={v}", " ".repeat(l.depth), l.key.unwrap_or_default())
+                })
+                .collect()
+        };
+        assert_eq!(show(&[]), ["id=7", "tags=[]", "addr={2 fields}"]);
+        assert_eq!(
+            show(&["/addr"]),
+            [
+                "id=7",
+                "tags=[]",
+                "addr={",
+                " city=\"Lyon\"",
+                " geo={1 field}"
+            ]
+        );
+        // a child stays unfolded under a folded parent, and shows again with it
+        assert_eq!(show(&["/addr/geo"]), ["id=7", "tags=[]", "addr={2 fields}"]);
+        assert_eq!(show(&["/addr", "/addr/geo"]).last().unwrap(), "  lat=45.7");
+    }
+
+    /// Clicking a folded line in the rendered inspector unfolds it.
+    #[gpui::test]
+    fn clicking_a_tree_line_unfolds_it(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["name".into(), "tags".into()],
+            rows: vec![serde_json::from_str(r#"{"name": "Mouse", "tags": ["a", "b"]}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("tree-tags").expect("tags line is rendered");
+        cx.simulate_click(bounds.center(), Default::default());
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert!(v.unfolded.contains("/tags"), "click reached the line")
+        });
+        assert!(
+            cx.debug_bounds("tree-0").is_some(),
+            "unfolded items are rendered"
+        );
+    }
+
+    /// Typing in `:` lists every match; ↓ moves the highlight; clicking one runs it.
+    /// (clicks `settings`, which only opens a popup: `theme ..` would write config.toml)
+    #[gpui::test]
+    fn command_palette_lists_and_runs_matches(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.mode = Mode::Normal; // no connections opens the add-connection form
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        let typing = |text: &str| {
+            let keys: Vec<KeyEvent> = text
+                .chars()
+                .map(|c| KeyEvent::new(KeyCode::Char(c)))
+                .collect();
+            move |v: &mut Db9s, cx: &mut Context<Db9s>| {
+                for k in &keys {
+                    v.rt.block_on(v.app.handle_key(*k));
+                }
+                cx.notify();
+            }
+        };
+        view.update(cx, typing(":th"));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("palette-theme default").is_some());
+        assert!(cx.debug_bounds("palette-theme nord").is_some());
+        view.update(cx, |v, _| {
+            v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Down)));
+            assert_eq!(v.app.command_idx, 1);
+            v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Esc)));
+        });
+        view.update(cx, typing(":se"));
+        cx.run_until_parked();
+        let settings = cx
+            .debug_bounds("palette-settings")
+            .expect("settings is listed");
+        cx.simulate_click(settings.center(), Default::default());
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(matches!(v.app.mode, Mode::Settings)));
+    }
+
+    /// `e` then enter edits the selected row's field right in the grid.
+    #[gpui::test]
+    fn field_edit_happens_in_the_grid(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(App::new(Default::default(), false));
+        app.screen = Screen::Browse;
+        app.browse_focus = BrowseFocus::Rows;
+        app.mode = Mode::Normal;
+        app.result = Some(db9s_core::datasource::QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![serde_json::from_str(r#"{"id": 1, "name": "Mouse"}"#).unwrap()],
+            affected: None,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| Db9s::new(app, rt, cx));
+        view.update(cx, |v, cx| {
+            for k in [
+                KeyCode::Char('e'),
+                KeyCode::Char('j'),
+                KeyCode::Enter,
+                KeyCode::Char('X'),
+            ] {
+                v.rt.block_on(v.app.handle_key(KeyEvent::new(k)));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("cell-edit-name").is_some(),
+            "name cell is in edit"
+        );
+        assert!(cx.debug_bounds("cell-edit-id").is_none());
+        view.update(cx, |v, _| {
+            v.rt.block_on(v.app.handle_key(KeyEvent::new(KeyCode::Enter)));
+            let fe = v.app.field_edit.as_ref().unwrap();
+            assert_eq!(fe.edited["name"], "MouseX");
+        });
     }
 
     #[test]
