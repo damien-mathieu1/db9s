@@ -48,3 +48,22 @@ jobs:
           tag_name: ${{ inputs.tag }}
           files: db9s-*.*
 
+  # The desktop app, macOS only for now: db9s.app zipped per arch, for the cask.
+  gui-macos:
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]  # x86_64 cross-compiled
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p db9s-gui --target ${{ matrix.target }}
+      - run: dev/macos-app.sh ${{ matrix.target }} ${{ inputs.tag }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: db9s-gui-*.zip
