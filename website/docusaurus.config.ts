@@ -7,7 +7,7 @@ const repo = 'https://github.com/damien-mathieu1/db9s';
 const config: Config = {
   title: 'db9s',
   tagline: 'Browse, query and edit your databases and queues, k9s-style',
-  favicon: 'img/logo.svg',
+  favicon: 'img/favicon.svg',
 
   url: 'https://damien-mathieu1.github.io',
   baseUrl: '/db9s/',
@@ -52,7 +52,7 @@ const config: Config = {
       title: 'db9s',
       logo: {
         alt: 'db9s logo',
-        src: 'img/logo.svg',
+        src: 'img/favicon.svg',
       },
       items: [
         {
