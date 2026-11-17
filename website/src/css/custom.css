@@ -1,0 +1,284 @@
+html, body {
+  overflow-x: hidden;
+}
+
+/* Root variables for the chess-inspired theme */
+:root {
+  --ifm-color-primary: #3e3e3e; /* Dark color for background or primary accents */
+  --ifm-color-primary-dark: #2b2b2b; /* Darker color for deeper contrasts */
+  --ifm-color-primary-darker: #1a1a1a; /* Even darker shade for dark accents */
+  --ifm-color-primary-darkest: #101010; /* Deepest shade for background */
+  --ifm-color-primary-light: #5f87af; /* Light, neutral blue, akin to steel chess pieces */
+  --ifm-color-primary-lighter: #7aa2c7; /* Lighter blue */
+  --ifm-color-primary-lightest: #dbe7f3; /* Lightest shade, cream-colored */
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(62, 62, 62, 0.1); /* Highlighted code line background */
+  --ifm-background-color: #faf9f6; /* Light mode background - warm off-white */
+}
+
+/* Light mode specific colors */
+html[data-theme='light'] {
+  --ifm-background-color: #faf9f6; /* Warm off-white instead of pure white */
+  --ifm-color-primary: #3e3e3e;
+}
+
+/* Dark mode specific colors */
+[data-theme='dark'] {
+  --ifm-color-primary: #3e3e3e; /* Dark color for background or primary accents */
+  --ifm-color-primary-dark: #2b2b2b; /* Darker color for deeper contrasts */
+  --ifm-color-primary-darker: #1a1a1a; /* Even darker shade for dark accents */
+  --ifm-color-primary-darkest: #101010; /* Deepest shade for background */
+  --ifm-color-primary-light: #7aa2c7; /* Lighter blue for dark mode */
+  --ifm-color-primary-lighter: #93b6d6; /* A bit warmer blue */
+  --ifm-color-primary-lightest: #c3d7ea; /* Light cream shade for dark mode */
+  --docusaurus-highlighted-code-line-bg: rgba(62, 62, 62, 0.3); /* Highlighted code line background */
+}
+
+a {
+  color: var(--ifm-color-primary-light); /* Light color for links */
+}
+
+a:hover {
+  color: var(--ifm-color-primary-lighter); /* Slightly warmer color for hover state */
+}
+
+.navbar__link--active {
+  color: var(--ifm-color-primary-lighter); /* Slightly warmer color for focus state */
+}
+
+.navbar__link:hover {
+  color: var(--ifm-color-primary-lighter); /* Slightly warmer color for hover state */
+}
+
+/* Apply background color and text color to footer */
+footer.footer {
+  background-color: var(--ifm-color-primary-darkest); /* Darkest background for footer */
+  color: var(--ifm-color-primary-light); /* Light text color for footer */
+}
+
+/* Customize footer links */
+footer.footer a {
+  color: var(--ifm-color-primary-lightest); /* Light color for links */
+}
+
+footer.footer a:hover {
+  color: var(--ifm-color-primary-lighter); /* Slightly warmer color for hover state */
+}
+
+/* Ensure the theme toggle button aligns properly */
+.navbar__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+/* Adjust spacing or alignment if necessary */
+.navbar__toggle svg {
+  vertical-align: middle;
+  height: 1.2em; /* Adjust size to match GitHub icons */
+  margin-left: 8px; /* Fine-tune the spacing */
+  margin-right: 8px; /* Fine-tune the spacing */
+}
+
+/* Adjust GitHub badge alignment */
+.header-github-link img {
+  vertical-align: middle;
+}
+
+#challenge{
+  width: 76%;
+}
+
+.feature-img {
+  width: 50%;
+}
+
+/* Make GitHub badge responsive on mobile */
+@media screen and (max-width: 996px) {
+  .header-github-link img {
+    max-height: 20px; /* Smaller badge on mobile */
+  }
+}
+
+@media screen and (max-width: 480px) {
+  .header-github-link {
+    display: none; /* Hide GitHub badge on very small screens to save space */
+  }
+}
+
+/* Hide the burger menu (sidebar toggle button) - only on desktop */
+@media screen and (min-width: 997px) {
+  .navbar__sidebar-toggle {
+    display: none !important;
+  }
+}
+
+/* Show mobile navigation burger menu on mobile */
+@media screen and (max-width: 996px) {
+  .navbar__toggle,
+  button.navbar__toggle {
+    display: flex !important;
+  }
+}
+
+/* Ensure main page background is theme-aware */
+html[data-theme='light'] {
+  --ifm-background-color: #faf9f6; /* Warm off-white */
+}
+
+html[data-theme='light'] body {
+  background-color: var(--ifm-background-color);
+}
+
+html[data-theme='light'] main {
+  background-color: var(--ifm-background-color);
+}
+
+html[data-theme='light'] .hero--primary {
+  background-color: var(--ifm-background-color) !important;
+}
+
+html[data-theme='light'] .hero {
+  background-color: var(--ifm-background-color);
+}
+
+/* Intro page header layout */
+.intro-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2rem;
+}
+
+.intro-content {
+  flex: 1;
+  order: 1;
+}
+
+.intro-logo {
+  margin-left: 20px;
+  flex-shrink: 0;
+  order: 2;
+}
+
+/* Stack logo above content on mobile */
+@media screen and (max-width: 996px) {
+  .intro-header {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+  }
+  
+  .intro-logo {
+    margin-left: 0;
+    margin-bottom: 1.5rem;
+    order: 1; /* Logo first on mobile */
+  }
+  
+  .intro-content {
+    width: 100%;
+    order: 2; /* Content second on mobile */
+  }
+}
+
+@media screen and (max-width: 480px) {
+  .intro-logo img {
+    width: 150px; /* Smaller logo on very small screens */
+    height: auto;
+  }
+  
+  .intro-logo {
+    margin-bottom: 1rem;
+  }
+}
+
+/* General mobile improvements */
+@media screen and (max-width: 996px) {
+  /* Improve navbar on mobile */
+  .navbar__items {
+    flex-wrap: wrap;
+  }
+  
+  /* Better spacing for navbar items on mobile */
+  .navbar__item {
+    margin: 0.25rem 0;
+  }
+  
+  /* Ensure container doesn't overflow on mobile */
+  .container {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
+
+@media screen and (max-width: 480px) {
+  /* Even tighter spacing on very small screens */
+  .container {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+  
+  /* Improve navbar brand on mobile */
+  .navbar__brand {
+    font-size: 1rem;
+  }
+  
+  /* Better table responsiveness in docs */
+  table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+.footer {
+  padding: 1.5rem 0;
+}
+
+.footer__col {
+  text-align: center;
+}
+
+.footer__title {
+  font-size: 0.8rem;
+}
+
+.footer__link-item {
+  font-size: 0.75rem;
+}
+
+@media (max-width: 996px) {
+  .footer__links {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 1.5rem 2rem;
+    align-items: flex-start;
+  }
+
+  .footer__col {
+    flex: 1 1 25%;
+    text-align: center;
+    min-width: 80px;
+    max-width: 120px;
+  }
+
+  .footer__title {
+    font-size: 0.7rem;
+    margin-bottom: 0.3rem;
+  }
+
+  .footer__link-item {
+    font-size: 0.65rem;
+  }
+
+  .footer__items {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.1rem;
+  }
+}

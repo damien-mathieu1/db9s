@@ -12,6 +12,9 @@ cargo run -- --postgres postgres://db9s:db9s@localhost:55432/db9s --mysql mysql:
   --redis redis://localhost:56379 --rabbitmq http://db9s:db9s@localhost:55672
 ```
 
+SQLite needs no server: `dev/seed-sqlite.sh` writes `dev/db9s.sqlite` with the same
+data, then `cargo run -- --sqlite sqlite://$PWD/dev/db9s.sqlite`.
+
 The desktop GUI (`crates/db9s-gui`, GPUI, early) reads the same config.toml and is
 left out of the default build: `cargo run -p db9s-gui` (`--read-only` works too).
 

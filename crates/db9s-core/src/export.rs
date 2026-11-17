@@ -57,6 +57,8 @@ pub fn write(res: &QueryResult, format: &str, name: &str) -> Result<PathBuf> {
         .collect();
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let path = dir.join(format!("{safe}-{stamp}.{format}"));
+    // a fresh account may not have its Downloads folder yet
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
