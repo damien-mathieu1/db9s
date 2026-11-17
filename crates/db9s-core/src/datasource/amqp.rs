@@ -6,8 +6,10 @@ use crate::value::Row;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use lapin::options::{
-    BasicGetOptions, BasicNackOptions, BasicPublishOptions, ConfirmSelectOptions, QueuePurgeOptions,
+    BasicGetOptions, BasicNackOptions, BasicPublishOptions, ConfirmSelectOptions,
+    QueueDeclareOptions, QueuePurgeOptions,
 };
+use lapin::types::FieldTable;
 use lapin::{BasicProperties, Connection, ConnectionProperties};
 use reqwest::Url;
 use serde_json::{json, Map, Value};
@@ -121,6 +123,23 @@ impl DataSource for AmqpSource {
 
     async fn list_containers(&self, _vhost: &str) -> Result<Vec<String>> {
         Ok(self.queues.clone())
+    }
+
+    /// A passive declare only reads the queue's counters, it never creates one.
+    async fn metrics(&self, _vhost: &str, queue: &str) -> Result<Vec<(String, f64)>> {
+        let ch = self.conn.create_channel().await?;
+        let opts = QueueDeclareOptions {
+            passive: true,
+            ..Default::default()
+        };
+        let q = ch
+            .queue_declare(queue.into(), opts, FieldTable::default())
+            .await?;
+        ch.close(200, "metrics done".into()).await.ok();
+        Ok(vec![
+            ("ready".into(), q.message_count() as f64),
+            ("consumers".into(), q.consumer_count() as f64),
+        ])
     }
 
     // shortcut: AMQP can't skip messages, so offset gets limit+offset and drops the head; fine for peeking

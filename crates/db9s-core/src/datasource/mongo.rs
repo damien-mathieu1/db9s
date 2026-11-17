@@ -1,4 +1,4 @@
-use super::{DataSource, QueryResult};
+use super::{DataSource, QueryResult, Sort};
 use crate::value::{bson_to_json, json_to_bson, Row};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -14,6 +14,31 @@ impl MongoSource {
         let client = Client::with_uri_str(url).await?;
         client.list_database_names().await?;
         Ok(Self { client })
+    }
+
+    async fn page(
+        &self,
+        database: &str,
+        container: &str,
+        limit: i64,
+        offset: i64,
+        sort: Option<&Sort>,
+    ) -> Result<QueryResult> {
+        let coll = self
+            .client
+            .database(database)
+            .collection::<mongodb::bson::Document>(container);
+        let opts = FindOptions::builder()
+            .limit(limit)
+            .skip(offset as u64)
+            .sort(sort.map(|s| doc! { s.column.as_str(): if s.desc { -1 } else { 1 } }))
+            .build();
+        let mut cursor = coll.find(doc! {}).with_options(opts).await?;
+        let mut docs = vec![];
+        while let Some(d) = cursor.try_next().await? {
+            docs.push(d);
+        }
+        Ok(Self::rows_to_result(docs))
     }
 
     fn rows_to_result(docs: Vec<mongodb::bson::Document>) -> QueryResult {
@@ -76,20 +101,32 @@ impl DataSource for MongoSource {
         limit: i64,
         offset: i64,
     ) -> Result<QueryResult> {
+        self.page(database, container, limit, offset, None).await
+    }
+
+    fn can_sort(&self) -> bool {
+        true
+    }
+
+    async fn fetch_sorted(
+        &self,
+        database: &str,
+        container: &str,
+        limit: i64,
+        offset: i64,
+        sort: &Sort,
+    ) -> Result<QueryResult> {
+        self.page(database, container, limit, offset, Some(sort))
+            .await
+    }
+
+    async fn count_rows(&self, database: &str, container: &str) -> Result<Option<u64>> {
         let coll = self
             .client
             .database(database)
             .collection::<mongodb::bson::Document>(container);
-        let opts = FindOptions::builder()
-            .limit(limit)
-            .skip(offset as u64)
-            .build();
-        let mut cursor = coll.find(doc! {}).with_options(opts).await?;
-        let mut docs = vec![];
-        while let Some(d) = cursor.try_next().await? {
-            docs.push(d);
-        }
-        Ok(Self::rows_to_result(docs))
+        // metadata count: instant on big collections, unlike count_documents
+        Ok(Some(coll.estimated_document_count().await?))
     }
 
     async fn run_query(&self, database: &str, container: &str, raw: &str) -> Result<QueryResult> {
@@ -138,6 +175,80 @@ impl DataSource for MongoSource {
         Ok(())
     }
 
+    async fn preview_delete(&self, _: &str, container: &str, row: &Row) -> Result<Option<String>> {
+        let id = row
+            .get("_id")
+            .ok_or_else(|| anyhow!("document has no _id"))?;
+        Ok(Some(format!("db.{container}.deleteOne({{\"_id\": {id}}})")))
+    }
+
+    /// Shows the fields that change; the update `$set`s the whole edited document, which
+    /// ends in the same state.
+    async fn preview_update(
+        &self,
+        _: &str,
+        container: &str,
+        original: &Row,
+        edited: &Row,
+    ) -> Result<Option<String>> {
+        let id = original
+            .get("_id")
+            .ok_or_else(|| anyhow!("document has no _id"))?;
+        let changed: Row = edited
+            .iter()
+            .filter(|(k, v)| original.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Ok(Some(format!(
+            "db.{container}.updateOne({{\"_id\": {id}}}, {{\"$set\": {}}})",
+            serde_json::Value::Object(changed)
+        )))
+    }
+
+    async fn insert_row(&self, database: &str, container: &str, row: &Row) -> Result<()> {
+        let coll = self
+            .client
+            .database(database)
+            .collection::<mongodb::bson::Document>(container);
+        let doc = mongodb::bson::to_document(&serde_json::Value::Object(row.clone()))?;
+        coll.insert_one(doc).await?;
+        Ok(())
+    }
+
+    /// Schemaless: the fields of the first 100 documents, with the JSON types seen
+    /// and how many documents have each.
+    async fn describe(&self, database: &str, container: &str) -> Result<QueryResult> {
+        let sample = self.page(database, container, 100, 0, None).await?;
+        let n = sample.rows.len();
+        let rows = sample
+            .columns
+            .iter()
+            .map(|col| {
+                let mut types: Vec<&str> = vec![];
+                let mut seen = 0;
+                for r in &sample.rows {
+                    if let Some(v) = r.get(col) {
+                        seen += 1;
+                        let t = json_type(v);
+                        if !types.contains(&t) {
+                            types.push(t);
+                        }
+                    }
+                }
+                let mut row = Row::new();
+                row.insert("field".into(), col.clone().into());
+                row.insert("types".into(), types.join(" | ").into());
+                row.insert("in".into(), format!("{seen}/{n}").into());
+                row
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: vec!["field".into(), "types".into(), "in".into()],
+            rows,
+            affected: None,
+        })
+    }
+
     async fn update_row(
         &self,
         database: &str,
@@ -157,6 +268,18 @@ impl DataSource for MongoSource {
         coll.update_one(doc! { "_id": id_filter(id)? }, doc! { "$set": new_doc })
             .await?;
         Ok(())
+    }
+}
+
+fn json_type(v: &serde_json::Value) -> &'static str {
+    use serde_json::Value;
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

@@ -180,10 +180,44 @@ jobs:
           end
           EOF
 
+      - name: Generate cask (desktop app)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/assets" --pattern 'db9s-gui-*.zip'
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          sha() { sha256sum "$RUNNER_TEMP/assets/db9s-gui-$TAG-$1.zip" | cut -d' ' -f1; }
+          mkdir -p Casks
+          cat > Casks/db9s-gui.rb <<EOF
+          cask "db9s-gui" do
+            version "${TAG#v}"
+
+            on_arm do
+              url "$base/db9s-gui-$TAG-aarch64-apple-darwin.zip"
+              sha256 "$(sha aarch64-apple-darwin)"
+            end
+            on_intel do
+              url "$base/db9s-gui-$TAG-x86_64-apple-darwin.zip"
+              sha256 "$(sha x86_64-apple-darwin)"
+            end
+
+            name "db9s"
+            desc "Desktop client for Postgres, MySQL, SQLite, MongoDB, Redis and RabbitMQ"
+            homepage "https://github.com/$GITHUB_REPOSITORY"
+
+            app "db9s.app"
+
+            caveats <<~TXT
+              db9s.app is not notarized. If macOS says it can't be opened, run:
+                xattr -dr com.apple.quarantine "#{appdir}/db9s.app"
+            TXT
+          end
+          EOF
+
       - name: Commit and push formula
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/db9s.rb
+          git add Formula/db9s.rb Casks/db9s-gui.rb
           git diff --cached --quiet || git commit -m "chore: bump db9s ${TAG#v}"
           git push origin HEAD:main

@@ -4,6 +4,8 @@
 pub mod app;
 pub mod config;
 pub mod datasource;
+pub mod export;
+pub mod history;
 pub mod input;
 pub mod key;
 pub mod secrets;

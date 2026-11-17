@@ -18,6 +18,11 @@ impl SqlDialect for MySqlDialect {
          WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY' \
          ORDER BY ordinal_position";
     const READ_ONLY_SESSION: &'static str = "SET SESSION TRANSACTION READ ONLY";
+    const DESCRIBE: &'static str = "SELECT CAST(column_name AS CHAR) AS `column`, \
+         CAST(column_type AS CHAR) AS `type`, CAST(is_nullable AS CHAR) AS nullable, \
+         CAST(column_default AS CHAR) AS `default` \
+         FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+         ORDER BY ordinal_position";
 
     fn quote(ident: &str) -> String {
         format!("`{}`", ident.replace('`', "``"))

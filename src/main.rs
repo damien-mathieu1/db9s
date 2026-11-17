@@ -36,6 +36,9 @@ struct Args {
     /// One-off MySQL / MariaDB url, added as a connection named "mysql"
     #[arg(long)]
     mysql: Option<String>,
+    /// One-off SQLite file (sqlite://path/to/file.db), added as a connection named "sqlite"
+    #[arg(long)]
+    sqlite: Option<String>,
     /// Open every connection read-only for this session, whatever the config says
     #[arg(long)]
     read_only: bool,
@@ -82,6 +85,15 @@ async fn main() -> Result<()> {
         cfg.connections.push(config::Connection {
             name: "mysql".into(),
             kind: config::Kind::MySql,
+            url,
+            read_only: false,
+        });
+    }
+
+    if let Some(url) = args.sqlite {
+        cfg.connections.push(config::Connection {
+            name: "sqlite".into(),
+            kind: config::Kind::Sqlite,
             url,
             read_only: false,
         });

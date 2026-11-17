@@ -88,6 +88,37 @@ fn decode_pg_value(row: &sqlx::postgres::PgRow, col: &sqlx::postgres::PgColumn) 
     result.unwrap_or(Value::Null)
 }
 
+/// SQLite types values, not columns: decode by each value's storage class.
+pub fn sqlite_row_to_json(row: &sqlx::sqlite::SqliteRow) -> Row {
+    use sqlx::{Column, Row as _, TypeInfo, ValueRef};
+    let mut map = Map::new();
+    for col in row.columns() {
+        let idx = col.ordinal();
+        let class = row
+            .try_get_raw(idx)
+            .map(|v| {
+                if v.is_null() {
+                    "NULL".to_string()
+                } else {
+                    v.type_info().name().to_string()
+                }
+            })
+            .unwrap_or_else(|_| "NULL".into());
+        let val = match class.as_str() {
+            "NULL" => None,
+            "INTEGER" => row.try_get::<i64, _>(idx).ok().map(Value::from),
+            "REAL" => row.try_get::<f64, _>(idx).ok().map(Value::from),
+            "BLOB" => row
+                .try_get::<Vec<u8>, _>(idx)
+                .ok()
+                .map(|b| Value::String(format!("<binary {} bytes>", b.len()))),
+            _ => row.try_get::<String, _>(idx).ok().map(Value::String),
+        };
+        map.insert(col.name().to_string(), val.unwrap_or(Value::Null));
+    }
+    map
+}
+
 pub fn mysql_row_to_json(row: &sqlx::mysql::MySqlRow) -> Row {
     use sqlx::{Column, Row as _, TypeInfo, ValueRef};
     let mut map = Map::new();
