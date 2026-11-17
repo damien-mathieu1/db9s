@@ -1,7 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect x="2" y="2" width="60" height="60" rx="12" fill="#1a1b1e" stroke="#5f87af" stroke-width="3"/>
-  <ellipse cx="32" cy="18" rx="16" ry="6" fill="none" stroke="#5f87af" stroke-width="3"/>
-  <path d="M16 18v26c0 3.3 7.2 6 16 6s16-2.7 16-6V18" fill="none" stroke="#5f87af" stroke-width="3"/>
-  <path d="M16 31c0 3.3 7.2 6 16 6s16-2.7 16-6" fill="none" stroke="#5f87af" stroke-width="3"/>
-  <text x="32" y="47" font-family="Menlo, monospace" font-size="11" font-weight="bold" fill="#ffffaf" text-anchor="middle">9s</text>
+  <rect width="64" height="64" rx="14" fill="#282828"/>
+  <path d="M12 15v11a20 6 0 0 0 40 0V15a20 6 0 0 1-40 0z" fill="#d65d0e"/>
+  <path d="M12 28.5v18.5a20 6 0 0 0 40 0V28.5a20 6 0 0 1-40 0z" fill="#d65d0e"/>
+  <ellipse cx="32" cy="15" rx="20" ry="6" fill="#fe8019"/>
+  <path d="M17 37l3.5 2.6-3.5 2.6" fill="none" stroke="#fabd2f" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="35" y="48" font-family="Menlo, Monaco, 'DejaVu Sans Mono', Consolas, monospace" font-size="13.5" font-weight="700" fill="#fbf1c7" text-anchor="middle">db9s</text>
 </svg>
