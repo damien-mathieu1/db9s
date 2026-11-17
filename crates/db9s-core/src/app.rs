@@ -4,7 +4,9 @@ use crate::input::Input;
 use crate::key::{KeyCode, KeyEvent};
 use crate::value::Row;
 use anyhow::Result;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -68,7 +70,8 @@ pub struct ConnEntry {
     pub url: String,
     /// As saved in the config; `--read-only` comes on top, see `App::force_read_only`.
     pub read_only: bool,
-    pub source: Result<Box<dyn DataSource>>,
+    /// Shared so a background task can use it while the UI keeps running.
+    pub source: Result<Arc<dyn DataSource>>,
 }
 
 /// Masks the password portion of a connection string, e.g.
@@ -152,6 +155,8 @@ pub struct App {
     pub new_conn_error: Option<String>,
     pub edit_target: Option<usize>,
     pub connecting: Option<PendingConnect>,
+    /// The database call in flight, if any; its result is applied by `poll`.
+    pending: Option<Pending>,
     pub new_conn_read_only: bool,
     /// `--read-only`: every connection of this session, without touching the config.
     pub force_read_only: bool,
@@ -210,6 +215,23 @@ pub struct PendingConnect {
     handle: JoinHandle<Result<Box<dyn DataSource>>>,
 }
 
+/// What a background database call produced, applied to the app by `poll`.
+enum Done {
+    Databases(Vec<String>),
+    Containers(Vec<String>),
+    /// Rows of the current container; `true` focuses the rows pane once they're in.
+    Rows(QueryResult, bool),
+    Query(QueryResult),
+    Saved,
+    Deleted,
+}
+
+struct Pending {
+    /// Writes are never aborted: a write cut mid-flight may or may not have applied.
+    write: bool,
+    handle: JoinHandle<Result<Done>>,
+}
+
 impl App {
     pub async fn new(cfg: Config, force_read_only: bool) -> Self {
         let editor_cmd = cfg
@@ -229,7 +251,9 @@ impl App {
 
         // connect concurrently so N unreachable servers cost one timeout, not N
         let futs = cfg.connections.into_iter().map(|c| async move {
-            let source = connect(c.kind, &c.url, c.read_only || force_read_only).await;
+            let source = connect(c.kind, &c.url, c.read_only || force_read_only)
+                .await
+                .map(Arc::from);
             ConnEntry {
                 name: c.name,
                 kind: c.kind,
@@ -281,14 +305,120 @@ impl App {
             new_conn_error: None,
             edit_target: None,
             connecting: None,
+            pending: None,
             new_conn_read_only: false,
             force_read_only,
         }
     }
 
-    /// Checks on any in-flight connection attempt; called once per event-loop tick
-    /// so the UI stays responsive while (dis)connecting.
-    pub async fn poll_connecting(&mut self) {
+    /// Applies whatever background work finished (a connection attempt, a database
+    /// call); called once per event-loop tick so the UI never waits on the network.
+    pub async fn poll(&mut self) {
+        self.poll_connecting().await;
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.handle.is_finished())
+        {
+            return;
+        }
+        let p = self.pending.take().unwrap();
+        match p.handle.await {
+            Ok(Ok(done)) => self.apply(done),
+            Ok(Err(e)) => self.status = format!("error: {e}"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => self.status = format!("error: database task panicked: {e}"),
+        }
+    }
+
+    /// Whether something is still running in the background (to keep polling).
+    pub fn is_busy(&self) -> bool {
+        self.pending.is_some() || self.connecting.is_some()
+    }
+
+    fn apply(&mut self, done: Done) {
+        match done {
+            Done::Databases(dbs) => {
+                self.databases = dbs;
+                self.db_idx = 0;
+                self.screen = Screen::Databases;
+                self.status = String::new();
+            }
+            Done::Containers(c) => {
+                self.containers = c;
+                self.container_idx = 0;
+                self.result = None;
+                self.screen = Screen::Browse;
+                self.browse_focus = BrowseFocus::Containers;
+                self.status = String::new();
+                self.load_rows();
+            }
+            Done::Rows(res, focus_rows) => {
+                self.row_idx = 0;
+                self.status = format!("{} rows (offset {})", res.rows.len(), self.offset);
+                self.result = Some(res);
+                if focus_rows {
+                    self.browse_focus = BrowseFocus::Rows;
+                }
+            }
+            Done::Query(res) => {
+                self.row_idx = 0;
+                self.status = match res.affected {
+                    Some(_) if self.is_queue() => "message published".into(),
+                    Some(n) => format!("{n} rows affected"),
+                    None => format!("{} rows", res.rows.len()),
+                };
+                self.result = Some(res);
+            }
+            Done::Saved => {
+                self.status = "saved".into();
+                self.load_rows();
+            }
+            Done::Deleted => {
+                self.status = "deleted".into();
+                self.load_rows();
+            }
+        }
+    }
+
+    /// Runs `op` on the current connection in the background. A new call replaces a
+    /// read still in flight; while a write runs, it is refused instead.
+    fn start<F>(&mut self, status: &str, write: bool, op: impl FnOnce(Arc<dyn DataSource>) -> F)
+    where
+        F: Future<Output = Result<Done>> + Send + 'static,
+    {
+        let Some(source) = self
+            .conns
+            .get(self.conn_idx)
+            .and_then(|c| c.source.as_ref().ok().cloned())
+        else {
+            return;
+        };
+        if let Some(p) = &self.pending {
+            if p.write {
+                self.status = "busy: a write is still running".into();
+                return;
+            }
+            p.handle.abort();
+        }
+        self.status = status.into();
+        self.pending = Some(Pending {
+            write,
+            handle: tokio::spawn(op(source)),
+        });
+    }
+
+    /// Aborts a read in flight; true if there was one.
+    fn cancel_read(&mut self) -> bool {
+        if !self.pending.as_ref().is_some_and(|p| !p.write) {
+            return false;
+        }
+        self.pending.take().unwrap().handle.abort();
+        self.status = "cancelled".into();
+        true
+    }
+
+    async fn poll_connecting(&mut self) {
         let is_done = match &self.connecting {
             Some(pc) => pc.handle.is_finished(),
             None => false,
@@ -339,7 +469,7 @@ impl App {
                 kind,
                 url,
                 read_only,
-                source: Ok(source),
+                source: Ok(Arc::from(source)),
             };
             self.conn_idx = idx;
         } else {
@@ -358,7 +488,7 @@ impl App {
                 kind,
                 url,
                 read_only,
-                source: Ok(source),
+                source: Ok(Arc::from(source)),
             });
             self.conn_idx = self.conns.len() - 1;
         }
@@ -381,6 +511,9 @@ impl App {
     }
 
     pub async fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc && matches!(self.mode, Mode::Normal) && self.cancel_read() {
+            return;
+        }
         match self.mode {
             Mode::Normal => self.handle_normal_key(key).await,
             Mode::Query => self.handle_query_key(key).await,
@@ -412,21 +545,21 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
-                self.preview_container().await;
+                self.preview_container();
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.move_selection(-1);
-                self.preview_container().await;
+                self.preview_container();
             }
-            KeyCode::Enter => self.enter().await,
-            KeyCode::Char('r') if self.rows_focused() => self.load_rows().await,
+            KeyCode::Enter => self.enter(),
+            KeyCode::Char('r') if self.rows_focused() => self.load_rows(),
             KeyCode::Char('n') if self.rows_focused() => {
                 self.offset += PAGE_SIZE;
-                self.load_rows().await;
+                self.load_rows();
             }
             KeyCode::Char('p') if self.rows_focused() => {
                 self.offset = (self.offset - PAGE_SIZE).max(0);
-                self.load_rows().await;
+                self.load_rows();
             }
             KeyCode::Char('/') if self.rows_focused() && self.is_queue() && self.is_read_only() => {
                 self.status = "read-only connection: publishing is off".into();
@@ -608,17 +741,15 @@ impl App {
                 {
                     self.container_idx = i;
                     self.browse_focus = BrowseFocus::Containers;
-                    self.preview_container().await;
-                    if self.result.is_some() {
-                        self.browse_focus = BrowseFocus::Rows;
-                    }
+                    self.offset = 0;
+                    self.fetch_rows(true);
                 } else if let Some(i) = (self.screen != Screen::Connections)
                     .then(|| find(&self.databases))
                     .flatten()
                 {
                     self.db_idx = i;
                     self.screen = Screen::Databases;
-                    self.enter().await;
+                    self.enter();
                 } else if let Some(i) = self
                     .conns
                     .iter()
@@ -626,7 +757,7 @@ impl App {
                 {
                     self.conn_idx = i;
                     self.screen = Screen::Connections;
-                    self.enter().await;
+                    self.enter();
                 } else {
                     self.status = format!("error: unknown command '{cmd}'");
                 }
@@ -635,10 +766,10 @@ impl App {
     }
 
     // shortcut: one fetch per keypress, no debounce; add one if holding j/k on many tables gets slow
-    async fn preview_container(&mut self) {
+    fn preview_container(&mut self) {
         if self.screen == Screen::Browse && self.browse_focus == BrowseFocus::Containers {
             self.offset = 0;
-            self.load_rows().await;
+            self.load_rows();
         }
     }
 
@@ -687,6 +818,8 @@ impl App {
     }
 
     fn go_back(&mut self) {
+        // a late result would otherwise jump back to the screen just left
+        self.cancel_read();
         match self.screen {
             Screen::Connections => {}
             Screen::Databases => self.screen = Screen::Connections,
@@ -707,7 +840,7 @@ impl App {
         }
     }
 
-    async fn enter(&mut self) {
+    fn enter(&mut self) {
         match self.screen {
             Screen::Connections => {
                 let entry = match self.conns.get(self.conn_idx) {
@@ -718,35 +851,18 @@ impl App {
                     self.status = format!("connection '{}' failed to connect", entry.name);
                     return;
                 }
-                self.status = "loading databases...".into();
-                match self.current_source().unwrap().list_databases().await {
-                    Ok(dbs) => {
-                        self.databases = dbs;
-                        self.db_idx = 0;
-                        self.screen = Screen::Databases;
-                        self.status = String::new();
-                    }
-                    Err(e) => self.status = format!("error: {e}"),
-                }
+                self.start("loading databases...", false, |s| async move {
+                    s.list_databases().await.map(Done::Databases)
+                });
             }
             Screen::Databases => {
                 let db = match self.current_db() {
                     Some(d) => d.to_string(),
                     None => return,
                 };
-                self.status = "loading containers...".into();
-                match self.current_source().unwrap().list_containers(&db).await {
-                    Ok(c) => {
-                        self.containers = c;
-                        self.container_idx = 0;
-                        self.result = None;
-                        self.screen = Screen::Browse;
-                        self.browse_focus = BrowseFocus::Containers;
-                        self.status = String::new();
-                        self.load_rows().await;
-                    }
-                    Err(e) => self.status = format!("error: {e}"),
-                }
+                self.start("loading containers...", false, |s| async move {
+                    s.list_containers(&db).await.map(Done::Containers)
+                });
             }
             Screen::Browse => match self.browse_focus {
                 BrowseFocus::Containers if self.result.is_some() => {
@@ -758,7 +874,11 @@ impl App {
         }
     }
 
-    async fn load_rows(&mut self) {
+    fn load_rows(&mut self) {
+        self.fetch_rows(false);
+    }
+
+    fn fetch_rows(&mut self, focus_rows: bool) {
         let db = match self.current_db() {
             Some(d) => d.to_string(),
             None => return,
@@ -767,20 +887,12 @@ impl App {
             Some(c) => c.to_string(),
             None => return,
         };
-        self.status = "loading rows...".into();
-        match self
-            .current_source()
-            .unwrap()
-            .fetch_rows(&db, &container, PAGE_SIZE, self.offset)
-            .await
-        {
-            Ok(res) => {
-                self.row_idx = 0;
-                self.status = format!("{} rows (offset {})", res.rows.len(), self.offset);
-                self.result = Some(res);
-            }
-            Err(e) => self.status = format!("error: {e}"),
-        }
+        let offset = self.offset;
+        self.start("loading rows...", false, move |s| async move {
+            s.fetch_rows(&db, &container, PAGE_SIZE, offset)
+                .await
+                .map(|r| Done::Rows(r, focus_rows))
+        });
     }
 
     async fn handle_query_key(&mut self, key: KeyEvent) {
@@ -793,24 +905,10 @@ impl App {
                 let container = self.current_container().unwrap_or_default().to_string();
                 let raw = self.query_input.value().to_string();
                 self.mode = Mode::Normal;
-                self.status = "running query...".into();
-                match self
-                    .current_source()
-                    .unwrap()
-                    .run_query(&db, &container, &raw)
-                    .await
-                {
-                    Ok(res) => {
-                        self.row_idx = 0;
-                        self.status = match res.affected {
-                            Some(_) if self.is_queue() => "message published".into(),
-                            Some(n) => format!("{n} rows affected"),
-                            None => format!("{} rows", res.rows.len()),
-                        };
-                        self.result = Some(res);
-                    }
-                    Err(e) => self.status = format!("error: {e}"),
-                }
+                // a raw query may write, so it's never aborted
+                self.start("running query...", true, move |s| async move {
+                    s.run_query(&db, &container, &raw).await.map(Done::Query)
+                });
             }
             _ => {
                 self.query_input.handle(key);
@@ -818,21 +916,15 @@ impl App {
         }
     }
 
-    async fn save_row(&mut self, original: &Row, edited: &Row) {
+    fn save_row(&mut self, original: &Row, edited: &Row) {
         let db = self.current_db().unwrap_or_default().to_string();
         let container = self.current_container().unwrap_or_default().to_string();
-        match self
-            .current_source()
-            .unwrap()
-            .update_row(&db, &container, original, edited)
-            .await
-        {
-            Ok(_) => {
-                self.status = "saved".into();
-                self.load_rows().await;
-            }
-            Err(e) => self.status = format!("error: {e}"),
-        }
+        let (original, edited) = (original.clone(), edited.clone());
+        self.start("saving...", true, move |s| async move {
+            s.update_row(&db, &container, &original, &edited)
+                .await
+                .map(|_| Done::Saved)
+        });
     }
 
     fn start_field_edit(&mut self) {
@@ -891,7 +983,7 @@ impl App {
                 if fe.edited == fe.original {
                     self.status = "no changes".into();
                 } else {
-                    self.save_row(&fe.original, &fe.edited).await;
+                    self.save_row(&fe.original, &fe.edited);
                 }
             }
             KeyCode::Esc => {
@@ -947,7 +1039,7 @@ impl App {
             KeyCode::Char('y') => {
                 self.mode = Mode::Normal;
                 if let Some((original, edited)) = self.pending_edit.take() {
-                    self.save_row(&original, &edited).await;
+                    self.save_row(&original, &edited);
                 }
             }
             _ => {
@@ -971,18 +1063,11 @@ impl App {
                 let db = self.current_db().unwrap_or_default().to_string();
                 let container = self.current_container().unwrap_or_default().to_string();
                 self.mode = Mode::Normal;
-                match self
-                    .current_source()
-                    .unwrap()
-                    .delete_row(&db, &container, &row)
-                    .await
-                {
-                    Ok(_) => {
-                        self.status = "deleted".into();
-                        self.load_rows().await;
-                    }
-                    Err(e) => self.status = format!("error: {e}"),
-                }
+                self.start("deleting...", true, move |s| async move {
+                    s.delete_row(&db, &container, &row)
+                        .await
+                        .map(|_| Done::Deleted)
+                });
             }
             _ => self.mode = Mode::Normal,
         }
@@ -1206,6 +1291,126 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{complete, mask_password};
+    use super::{App, BrowseFocus, ConnEntry, Mode, Screen};
+    use crate::config::Kind;
+    use crate::datasource::{DataSource, QueryResult};
+    use crate::key::{KeyCode, KeyEvent};
+    use crate::value::Row;
+    use anyhow::Result;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Answers after `delay`; records whether a delete went through.
+    struct Slow {
+        delay: Duration,
+        deleted: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSource for Slow {
+        async fn list_databases(&self) -> Result<Vec<String>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(vec!["db".into()])
+        }
+        async fn list_containers(&self, _: &str) -> Result<Vec<String>> {
+            Ok(vec!["t".into()])
+        }
+        async fn fetch_rows(&self, _: &str, _: &str, _: i64, _: i64) -> Result<QueryResult> {
+            Ok(QueryResult {
+                columns: vec!["id".into()],
+                rows: vec![serde_json::from_str(r#"{"id": 1}"#).unwrap()],
+                affected: None,
+            })
+        }
+        async fn run_query(&self, _: &str, _: &str, _: &str) -> Result<QueryResult> {
+            unimplemented!()
+        }
+        async fn delete_row(&self, _: &str, _: &str, _: &Row) -> Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn update_row(&self, _: &str, _: &str, _: &Row, _: &Row) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn app_with(delay: Duration) -> (App, Arc<AtomicBool>) {
+        let mut app = App::new(Default::default(), false).await;
+        let deleted = Arc::new(AtomicBool::new(false));
+        app.conns.push(ConnEntry {
+            name: "slow".into(),
+            kind: Kind::Postgres,
+            url: String::new(),
+            read_only: false,
+            source: Ok(Arc::new(Slow {
+                delay,
+                deleted: deleted.clone(),
+            })),
+        });
+        app.mode = Mode::Normal;
+        (app, deleted)
+    }
+
+    async fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code)).await;
+    }
+
+    async fn settle(app: &mut App) {
+        while app.is_busy() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.poll().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn database_calls_run_in_the_background() {
+        let (mut app, _) = app_with(Duration::from_millis(50)).await;
+        press(&mut app, KeyCode::Enter).await;
+        // handle_key came back before the server answered
+        assert!(app.is_busy());
+        assert_eq!(app.screen, Screen::Connections);
+        assert_eq!(app.status, "loading databases...");
+        settle(&mut app).await;
+        assert_eq!(app.screen, Screen::Databases);
+        assert_eq!(app.databases, ["db"]);
+        // containers then the first container's rows chain on their own
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        assert_eq!(app.screen, Screen::Browse);
+        assert_eq!(app.result.as_ref().map(|r| r.rows.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn esc_cancels_a_slow_read() {
+        let (mut app, _) = app_with(Duration::from_secs(30)).await;
+        press(&mut app, KeyCode::Enter).await;
+        press(&mut app, KeyCode::Esc).await;
+        assert!(!app.is_busy());
+        assert_eq!(app.status, "cancelled");
+        assert_eq!(app.screen, Screen::Connections);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_never_aborted() {
+        let (mut app, deleted) = app_with(Duration::from_millis(50)).await;
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        press(&mut app, KeyCode::Enter).await;
+        settle(&mut app).await;
+        app.browse_focus = BrowseFocus::Rows;
+        press(&mut app, KeyCode::Char('d')).await;
+        press(&mut app, KeyCode::Char('y')).await;
+        assert_eq!(app.status, "deleting...");
+        // neither esc nor a new read stops it
+        press(&mut app, KeyCode::Esc).await;
+        press(&mut app, KeyCode::Char('j')).await;
+        assert!(app.is_busy());
+        settle(&mut app).await;
+        assert!(deleted.load(Ordering::SeqCst));
+        assert_eq!(app.status, "1 rows (offset 0)");
+    }
 
     #[test]
     fn completes_fish_style() {

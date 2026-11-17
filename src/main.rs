@@ -119,7 +119,7 @@ async fn event_loop(
 ) -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, app, lists))?;
-        app.poll_connecting().await;
+        app.poll().await;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {

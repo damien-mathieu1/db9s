@@ -72,8 +72,8 @@ impl Db9s {
                 .timer(Duration::from_millis(100))
                 .await;
             let alive = this.update(cx, |this, cx| {
-                if this.app.connecting.is_some() {
-                    this.rt.block_on(this.app.poll_connecting());
+                if this.app.is_busy() {
+                    this.rt.block_on(this.app.poll());
                     cx.notify();
                 }
             });
@@ -105,8 +105,7 @@ impl Db9s {
         let Some(key) = to_core_key(&ev.keystroke) else {
             return;
         };
-        // shortcut: blocks the UI while a query runs, exactly like the TUI loop does;
-        // move to a background task + "loading" state once queries need to be cancellable
+        // returns at once: database calls run in the background, applied by the poll tick
         self.rt.block_on(self.app.handle_key(key));
         if let Some(req) = self.app.editor_request.take() {
             let _ = std::fs::remove_file(&req.tmp_path);
