@@ -19,7 +19,7 @@ repository = "https://github.com/damien-mathieu1/db9s"
 readme = "README.md"
 keywords = ["tui", "postgres", "mongodb", "redis", "rabbitmq"]
 categories = ["command-line-utilities", "database"]
-exclude = ["dev/", "docker-compose.yml", ".github/"]
+exclude = ["dev/", "docker-compose.yml", ".github/", "website/"]
 
 [dependencies]
 # exact pin: both crates are always released together, at the same version

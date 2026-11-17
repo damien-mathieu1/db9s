@@ -2,6 +2,8 @@
 <h1>db9s</h1>
 A k9s-style terminal UI to browse, query, and edit your databases and message queues 🦀
 
+**[📖 Documentation](https://damien-mathieu1.github.io/db9s/)**
+
 ![db9s demo](./docs/demo.gif)
 
 <div>

@@ -1,0 +1,60 @@
+---
+sidebar_position: 1
+description: "db9s: a k9s-style terminal UI (and desktop app) to browse, query and edit Postgres, MySQL, SQLite, MongoDB, Redis and RabbitMQ."
+---
+
+# Getting started
+
+**db9s** is a [k9s](https://k9scli.io)-style terminal UI to browse, query and edit
+your databases and message queues, written in Rust. Every backend gets the same
+screens and the same keys, so once you know one, you know them all.
+
+![db9s demo](/gif/demo.gif)
+
+## What it does
+
+- **Browse** connections → databases → tables, collections, keys or queues → rows,
+  with a preview of the rows as you move through tables.
+- **Query** in each backend's own language: SQL, Mongo filters and pipelines, Redis
+  commands, or publish to a RabbitMQ queue. Past queries are kept per connection.
+- **Edit** rows field by field or in your `$EDITOR`, **insert** and **delete** them;
+  confirmations show the exact statement that will run.
+- **Sort**, page, see the table **schema**, **export** to CSV or JSON.
+- **Read-only** connections that refuse writes for real, secrets kept out of the
+  config, and themes.
+- A **desktop app** with the same screens plus a grid, a JSON inspector, tabs and
+  live charts.
+
+| Backend | |
+|---|---|
+| PostgreSQL | 🟢 |
+| MySQL / MariaDB | 🟢 |
+| SQLite | 🟢 |
+| MongoDB | 🟢 |
+| Redis | 🟢 |
+| RabbitMQ (management API or plain AMQP) | 🟢 |
+
+## Quick install
+
+```bash
+brew install damien-mathieu1/tap/db9s
+# or
+cargo install db9s
+```
+
+More options in [Installation](installation.md).
+
+## Quick start
+
+```bash
+db9s --postgres postgres://user:pass@localhost/db
+db9s --sqlite sqlite:///path/to/app.db
+db9s --mongo mongodb://localhost:27017
+```
+
+Or run `db9s` alone and add connections from the app (`a` on the connections
+screen); they are saved to your [config file](configuration/config-file.md).
+
+Then: `j`/`k` to move, `enter` to open, `tab` to switch between the tables and
+the rows, `esc` to go back, `:` to jump anywhere. The footer always lists the
+keys available where you are. Next: [Navigation](usage/navigation.md).
